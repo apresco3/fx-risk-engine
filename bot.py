@@ -234,8 +234,40 @@ def get_account_nav_and_currency():
     return nav, currency
 
 def close_position(instrument: str):
+    """
+    Close out the open Position for an instrument.
+    IMPORTANT: Only specify longUnits/shortUnits if that side exists.
+    """
+    # Use openPositions so we can see long vs short amounts.
+    r = oanda_get_open_positions()
+    if not r.ok:
+        raise RuntimeError(f"Failed to fetch open positions: HTTP {r.status_code} {r.text}")
+
+    long_units = 0
+    short_units = 0
+    for pos in r.json().get("positions", []):
+        if pos.get("instrument") == instrument:
+            long_units = int(pos.get("long", {}).get("units", "0"))
+            short_units = int(pos.get("short", {}).get("units", "0"))
+            break
+
+    payload = {}
+    if long_units > 0:
+        payload["longUnits"] = "ALL"
+    if short_units < 0:  # OANDA short units are typically negative
+        payload["shortUnits"] = "ALL"
+
+    if not payload:
+        # Already flat, nothing to close
+        class Dummy:
+            ok = True
+            status_code = 200
+            text = '{"skipped": true, "reason": "already_flat"}'
+            headers = {"Content-Type": "application/json"}
+            def json(self): return {"skipped": True, "reason": "already_flat"}
+        return Dummy()
+
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/positions/{instrument}/close"
-    payload = {"longUnits": "ALL", "shortUnits": "ALL"}
     return requests.put(url, json=payload, headers=HEADERS, timeout=10)
 
 def close_all_positions():
