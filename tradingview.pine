@@ -2,55 +2,100 @@
 // © ashtpres
 
 //@version=6
-indicator("EUR/USD bot alerts", overlay=true)
+indicator("USD/JPY bot alerts (OBSERVE -> GPT decides) + time/volume/range", overlay=true)
 
 // ====== INPUTS ======
-pair_input  = input.string("EUR_USD", "OANDA Pair (what your bot expects)", confirm=true)
-sl_pips     = input.int(20, "SL pips", minval=1)
-tp_pips     = input.int(40, "TP pips", minval=0)
+pair_input  = input.string("USD_JPY", "OANDA Pair (what your bot expects)", confirm=true)
+sl_pips     = input.int(25, "Default SL pips (hint only)", minval=1)
+tp_pips     = input.int(50, "Default TP pips (hint only)", minval=0)
 
-// Safety caps (keep in sync with bot .env MAX_SL_PIPS / MAX_TP_PIPS)
-max_sl_pips = input.int(20, "MAX SL pips (bot cap)", minval=1)
-max_tp_pips = input.int(40, "MAX TP pips (bot cap)", minval=0)
+// Safety caps
+max_sl_pips = input.int(25, "MAX SL pips (bot cap)", minval=1)
+max_tp_pips = input.int(50, "MAX TP pips (bot cap)", minval=0)
 
-// Simple starter signals: MA cross
-fastLen = input.int(10, "Fast MA", minval=1)
-slowLen = input.int(30, "Slow MA", minval=1)
+// Signal settings (these are features now, not direct trades)
+fastLen = input.int(12, "Fast EMA", minval=1)
+slowLen = input.int(36, "Slow EMA", minval=1)
 
+// Alert behavior
+fire_on_close = input.bool(true, "Fire observe on bar close only (recommended)")
+
+// Feature settings
+rsiLen = input.int(14, "RSI Len", minval=1)
+adxLen = input.int(14, "ADX Len", minval=1)
+atrLen = input.int(14, "ATR Len", minval=1)
+
+// ====== PIP SIZE ======
+pipSize = str.contains(pair_input, "JPY") ? 0.01 : 0.0001
+
+// ====== INDICATORS ======
 fast = ta.ema(close, fastLen)
 slow = ta.ema(close, slowLen)
 
-buySignal  = ta.crossover(fast, slow)
-sellSignal = ta.crossunder(fast, slow)
+buyCross  = ta.crossover(fast, slow)
+sellCross = ta.crossunder(fast, slow)
 
+trendUp   = fast > slow
+trendDown = fast < slow
+
+rsi = ta.rsi(close, rsiLen)
+[_, _, adx] = ta.dmi(adxLen, adxLen)
+atr = ta.atr(atrLen)
+
+// Derived features
+atr_pips      = atr / pipSize
+ema_sep_pips  = math.abs(fast - slow) / pipSize
+fast_slope_p  = (fast - fast[1]) / pipSize
+slow_slope_p  = (slow - slow[1]) / pipSize
+range_pips    = (high - low) / pipSize
+regime = adx >= 20 ? "trend" : "chop"
+
+// Bar time (ms since epoch). On confirmed bars, this is the bar close time.
+time_ms = time
+
+// ====== SAFETY ======
 can_trade = (sl_pips <= max_sl_pips) and (tp_pips <= max_tp_pips)
 
+shouldFire = fire_on_close ? barstate.isconfirmed : true
+freq = fire_on_close ? alert.freq_once_per_bar_close : alert.freq_once_per_bar
+
 // ====== ID BASE ======
-id_base = pair_input + ":" + str.tostring(time)
+id_base = pair_input + ":" + str.tostring(time_ms) + ":" + str.tostring(bar_index)
 
-// ====== JSON BUILDERS (single-line, no continuation issues) ======
-open_json(side) =>
-    "{\"alert_id\":\"" + id_base + ":open\",\"action\":\"open\",\"side\":\"" + side + "\",\"pair\":\"" + pair_input + "\",\"sl_pips\":" + str.tostring(sl_pips) + ",\"tp_pips\":" + str.tostring(tp_pips) + "}"
+// ====== JSON BUILDERS ======
+observe_json() =>
+    "{\"alert_id\":\"" + id_base + ":obs\",\"action\":\"observe\",\"pair\":\"" + pair_input + "\"," +
+     "\"sl_pips\":" + str.tostring(sl_pips) + ",\"tp_pips\":" + str.tostring(tp_pips) + "," +
+     "\"features\":{" +
+     "\"tf\":\"" + timeframe.period + "\"," +
+     "\"time_ms\":" + str.tostring(time_ms) + "," +
+     "\"volume\":" + str.tostring(volume) + "," +
+     "\"range_pips\":" + str.tostring(range_pips) + "," +
+     "\"open\":" + str.tostring(open) + "," +
+     "\"high\":" + str.tostring(high) + "," +
+     "\"low\":" + str.tostring(low) + "," +
+     "\"close\":" + str.tostring(close) + "," +
+     "\"rsi\":" + str.tostring(rsi) + "," +
+     "\"adx\":" + str.tostring(adx) + "," +
+     "\"atr_pips\":" + str.tostring(atr_pips) + "," +
+     "\"ema_sep_pips\":" + str.tostring(ema_sep_pips) + "," +
+     "\"fast_slope_pips\":" + str.tostring(fast_slope_p) + "," +
+     "\"slow_slope_pips\":" + str.tostring(slow_slope_p) + "," +
+     "\"buyCross\":" + str.tostring(buyCross) + "," +
+     "\"sellCross\":" + str.tostring(sellCross) + "," +
+     "\"trendUp\":" + str.tostring(trendUp) + "," +
+     "\"trendDown\":" + str.tostring(trendDown) + "," +
+     "\"fastLen\":" + str.tostring(fastLen) + "," +
+     "\"slowLen\":" + str.tostring(slowLen) + "," +
+     "\"regime\":\"" + regime + "\"" +
+     "}" +
+     "}"
 
-close_json() =>
-    "{\"alert_id\":\"" + id_base + ":close\",\"action\":\"close\",\"pair\":\"" + pair_input + "\"}"
-
-reverse_json(side) =>
-    "{\"alert_id\":\"" + id_base + ":reverse\",\"action\":\"reverse\",\"side\":\"" + side + "\",\"pair\":\"" + pair_input + "\",\"sl_pips\":" + str.tostring(sl_pips) + ",\"tp_pips\":" + str.tostring(tp_pips) + "}"
-
-// ====== FIRE ALERTS ======
-if buySignal and can_trade
-    alert(open_json("buy"), alert.freq_once_per_bar)
-
-if sellSignal and can_trade
-    alert(open_json("sell"), alert.freq_once_per_bar)
-
-// (Leave close/reverse disabled until you want them)
-// if buySignal or sellSignal
-//     alert(close_json(), alert.freq_once_per_bar)
+if can_trade and shouldFire
+    alert(observe_json(), freq)
 
 // ====== VISUALS ======
-plot(fast, title="Fast MA")
-plot(slow, title="Slow MA")
-plotshape(buySignal,  title="Buy",  style=shape.triangleup,   location=location.belowbar, text="BUY")
-plotshape(sellSignal, title="Sell", style=shape.triangledown, location=location.abovebar, text="SELL")
+plot(fast, title="Fast EMA")
+plot(slow, title="Slow EMA")
+plotshape(buyCross and shouldFire,  title="BuyCross",  style=shape.triangleup,   location=location.belowbar, text="XUP")
+plotshape(sellCross and shouldFire, title="SellCross", style=shape.triangledown, location=location.abovebar, text="XDN")
