@@ -32,8 +32,8 @@ MAX_NET_UNITS = int(os.getenv("MAX_NET_UNITS", "2000"))      # per-instrument ne
 SL_PIPS_DEFAULT = int(os.getenv("SL_PIPS", "20"))
 TP_PIPS_DEFAULT = int(os.getenv("TP_PIPS", "40"))
 
-# Spread filter
-MAX_SPREAD_PIPS = int(os.getenv("MAX_SPREAD_PIPS", "2"))     # 0 disables
+# Spread filter (float lets you use 1.5 pips if desired)
+MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))   # 0 disables
 
 # Equity sizing
 # Risk per trade as a fraction of NAV (e.g. 0.0025 = 0.25%)
@@ -200,7 +200,6 @@ def get_net_units_for_instrument(instrument: str) -> int:
     return 0
 
 def oanda_get_pricing(instrument: str):
-    # pricing endpoint
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing"
     params = {"instruments": instrument}
     return requests.get(url, headers=HEADERS, params=params, timeout=10)
@@ -223,8 +222,7 @@ def get_spread_pips(instrument: str) -> float:
     return float(spread / pip)
 
 def oanda_get_account_summary():
-    r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary", headers=HEADERS, timeout=10)
-    return r
+    return requests.get(f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary", headers=HEADERS, timeout=10)
 
 def get_account_nav_and_currency():
     r = oanda_get_account_summary()
@@ -239,6 +237,26 @@ def close_position(instrument: str):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/positions/{instrument}/close"
     payload = {"longUnits": "ALL", "shortUnits": "ALL"}
     return requests.put(url, json=payload, headers=HEADERS, timeout=10)
+
+def close_all_positions():
+    """
+    Closes ALL open positions across ALL instruments in the account.
+    """
+    r = oanda_get_open_positions()
+    if not r.ok:
+        raise RuntimeError(f"Failed to fetch open positions: HTTP {r.status_code} {r.text}")
+
+    instruments = [p.get("instrument") for p in r.json().get("positions", []) if p.get("instrument")]
+    results = []
+    for inst in instruments:
+        rc = close_position(inst)
+        results.append({
+            "instrument": inst,
+            "ok": bool(rc.ok),
+            "http_status": rc.status_code,
+            "response": (rc.json() if rc.headers.get("Content-Type", "").startswith("application/json") else {"raw": rc.text})
+        })
+    return results
 
 def place_market_order(*, instrument: str, signed_units: int, sl_pips: int, tp_pips: int):
     sl_dist, tp_dist = sl_tp_distance(instrument, sl_pips, tp_pips)
@@ -276,7 +294,6 @@ def sl_tp_distance(instrument: str, sl_pips: int, tp_pips: int):
 def compute_units_from_risk(
     *,
     instrument: str,
-    side: str,
     sl_pips: int,
     nav: Decimal,
     account_ccy: str
@@ -292,14 +309,14 @@ def compute_units_from_risk(
     """
     base, quote = instrument.split("_")
     pip = pip_size_for(instrument)
-    sl_dist_quote = pip * Decimal(sl_pips)  # SL distance in quote currency per 1 unit
+    sl_dist_quote = pip * Decimal(sl_pips)  # SL distance in quote currency per 1 unit (1 base unit)
 
     if sl_pips <= 0:
         raise RuntimeError("sl_pips must be > 0 for risk sizing")
 
     risk_budget_home = nav * RISK_PCT
 
-    # Case 1: account currency == quote currency (best / common for USD accounts with EUR_USD, GBP_USD, etc.)
+    # Case 1: account currency == quote currency (common for USD accounts with EUR_USD, GBP_USD, etc.)
     if quote == account_ccy:
         loss_per_unit_home = sl_dist_quote
 
@@ -311,20 +328,15 @@ def compute_units_from_risk(
                 f"Set ALLOW_NONQUOTE_HOME_SIZING=true to allow approximate conversion."
             )
 
-        # Approx conversion using pricing on quote_home instrument if exists:
-        # If account_ccy=USD and quote=JPY => need JPY_USD price (or USD_JPY inverted).
-        # We'll attempt:
-        #   quote_home = f"{quote}_{account_ccy}" (e.g., JPY_USD)
-        #   home_quote = f"{account_ccy}_{quote}" (e.g., USD_JPY) -> invert
         quote_home = f"{quote}_{account_ccy}"
         home_quote = f"{account_ccy}_{quote}"
 
         conv = None
+        # Try quote_home directly
         try:
             r = oanda_get_pricing(quote_home)
             if r.ok and r.json().get("prices"):
                 p = r.json()["prices"][0]
-                # mid approx
                 bid = Decimal(p["bids"][0]["price"])
                 ask = Decimal(p["asks"][0]["price"])
                 conv = (bid + ask) / Decimal(2)  # 1 quote = conv home
@@ -332,7 +344,7 @@ def compute_units_from_risk(
             conv = None
 
         if conv is None:
-            # try inverse
+            # Try inverse via home_quote
             r2 = oanda_get_pricing(home_quote)
             if not r2.ok or not r2.json().get("prices"):
                 raise RuntimeError(f"Failed to obtain conversion rate {quote}<->{account_ccy}")
@@ -365,8 +377,11 @@ def validate_payload(data: dict):
       {"alert_id":"...", "action":"open", "side":"buy|sell", "pair":"EUR_USD",
        "sl_pips":20, "tp_pips":40, "units":10 (optional)}
 
-    CLOSE:
+    CLOSE (single instrument):
       {"alert_id":"...", "action":"close", "pair":"EUR_USD"}
+
+    CLOSE_ALL:
+      {"alert_id":"...", "action":"close_all"}
 
     REVERSE:
       {"alert_id":"...", "action":"reverse", "side":"buy|sell", "pair":"EUR_USD",
@@ -378,13 +393,20 @@ def validate_payload(data: dict):
 
     if not alert_id:
         return None, "Missing alert_id"
-    if "_" not in pair:
-        return None, "Invalid pair format (use EUR_USD)"
-    if action not in {"open", "close", "reverse"}:
-        return None, "Invalid action (open|close|reverse)"
+    if action not in {"open", "close", "close_all", "reverse"}:
+        return None, "Invalid action (open|close|close_all|reverse)"
+
+    if action == "close_all":
+        return {"alert_id": alert_id, "action": action}, None
 
     if action == "close":
+        if "_" not in pair:
+            return None, "Invalid pair format (use EUR_USD)"
         return {"alert_id": alert_id, "action": action, "pair": pair}, None
+
+    # open / reverse
+    if "_" not in pair:
+        return None, "Invalid pair format (use EUR_USD)"
 
     side = str(data.get("side", "")).lower().strip()
     if side not in {"buy", "sell"}:
@@ -479,6 +501,11 @@ def webhook():
         log("AUTH BLOCKED | invalid webhook key")
         return {"status": "UNAUTHORIZED"}, 401
 
+    # optional: log raw body for debugging TradingView formatting
+    raw = request.get_data(as_text=True)
+    if raw:
+        log(f"RAW BODY | {raw}")
+
     if not TRADING_ENABLED:
         return {"status": "DISABLED"}, 200
 
@@ -492,7 +519,7 @@ def webhook():
     if seen_before(alert_id):
         log(f"DUPLICATE IGNORED | alert_id={alert_id}")
         db_record_execution(
-            alert_id=alert_id, action=payload["action"], instrument=payload["pair"],
+            alert_id=alert_id, action=payload["action"], instrument=payload.get("pair", "N/A"),
             side=payload.get("side"), units=payload.get("units"),
             sl_pips=payload.get("sl_pips"), tp_pips=payload.get("tp_pips"),
             status="DUPLICATE_IGNORED", oanda_http=None, oanda_response=None
@@ -500,9 +527,35 @@ def webhook():
         return {"status": "DUPLICATE_IGNORED"}, 200
 
     action = payload["action"]
+
+    # CLOSE ALL
+    if action == "close_all":
+        try:
+            results = close_all_positions()
+            log(f"CLOSE_ALL | alert_id={alert_id} | closed={len(results)}")
+            for item in results:
+                db_record_execution(
+                    alert_id=alert_id,
+                    action="close",
+                    instrument=item["instrument"],
+                    side=None, units=None, sl_pips=None, tp_pips=None,
+                    current_net=None, projected_net=None, spread_pips=None,
+                    oanda_http=item["http_status"],
+                    status=("OK" if item["ok"] else "OANDA_ERROR"),
+                    oanda_response=str(item["response"])
+                )
+            return {"status": "OK", "results": results}, 200
+        except Exception as e:
+            log(f"ERROR | CLOSE_ALL | alert_id={alert_id} | {repr(e)}")
+            db_record_execution(
+                alert_id=alert_id, action="close_all", instrument="ALL",
+                status="ERROR", oanda_response=repr(e), oanda_http=None
+            )
+            return {"status": "ERROR", "error": str(e)}, 502
+
     pair = payload["pair"]
 
-    # CLOSE
+    # CLOSE (single)
     if action == "close":
         try:
             r = close_position(pair)
@@ -515,7 +568,10 @@ def webhook():
                 oanda_http=r.status_code, status=("OK" if r.ok else "OANDA_ERROR"),
                 oanda_response=body
             )
-            return {"status": "OK" if r.ok else "OANDA_ERROR", "http_status": r.status_code, "response": (r.json() if r.headers.get("Content-Type","").startswith("application/json") else {"raw": r.text})}, (200 if r.ok else 502)
+            return {"status": "OK" if r.ok else "OANDA_ERROR",
+                    "http_status": r.status_code,
+                    "response": (r.json() if r.headers.get("Content-Type","").startswith("application/json") else {"raw": r.text})
+                    }, (200 if r.ok else 502)
         except requests.RequestException as e:
             log(f"NETWORK ERROR | CLOSE | alert_id={alert_id} | {pair} | {repr(e)}")
             db_record_execution(
@@ -566,7 +622,10 @@ def webhook():
                     side=side, units=None, sl_pips=sl_pips, tp_pips=tp_pips,
                     current_net=None, projected_net=None, spread_pips=spread_pips_val
                 )
-                return {"status": "OANDA_ERROR", "step": "close", "http_status": r_close.status_code, "response": (r_close.json() if r_close.headers.get("Content-Type","").startswith("application/json") else {"raw": r_close.text})}, 502
+                return {"status": "OANDA_ERROR", "step": "close",
+                        "http_status": r_close.status_code,
+                        "response": (r_close.json() if r_close.headers.get("Content-Type","").startswith("application/json") else {"raw": r_close.text})
+                        }, 502
         except requests.RequestException as e:
             log(f"NETWORK ERROR | REVERSE-CLOSE | alert_id={alert_id} | {pair} | {repr(e)}")
             db_record_execution(
@@ -595,11 +654,10 @@ def webhook():
         nav, acct_ccy = get_account_nav_and_currency()
         if FORCE_RISK_SIZING or payload.get("units") is None:
             units = compute_units_from_risk(
-                instrument=pair, side=side, sl_pips=sl_pips, nav=nav, account_ccy=acct_ccy
+                instrument=pair, sl_pips=sl_pips, nav=nav, account_ccy=acct_ccy
             )
         else:
             units = int(payload["units"])
-            # still cap
             units = min(units, MAX_UNITS)
             units = max(1, units)
     except Exception as e:
@@ -613,8 +671,8 @@ def webhook():
         return {"status": "RISK_BLOCKED_SIZING_FAIL", "error": str(e)}, 403
 
     signed_units = -units if side == "sell" else units
-
     projected_net = current_net + signed_units
+
     if abs(projected_net) > MAX_NET_UNITS:
         log(f"RISK BLOCKED (MAX_NET_UNITS) | alert_id={alert_id} | {pair} current={current_net} new={signed_units} proj={projected_net} cap={MAX_NET_UNITS}")
         db_record_execution(
@@ -668,5 +726,5 @@ def webhook():
 
 
 if __name__ == "__main__":
-    # Dev only. Production uses gunicorn (see below).
+    # Dev only. Production uses gunicorn.
     app.run(host="0.0.0.0", port=PORT, debug=False)
