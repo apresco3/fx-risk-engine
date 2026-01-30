@@ -468,7 +468,11 @@ def seen_before(alert_id: str) -> bool:
 # OANDA helpers
 # ============================================================
 def pip_size_for(instrument: str) -> Decimal:
-    return Decimal("0.01") if instrument.endswith("_JPY") else Decimal("0.0001")
+    if "XAU" in instrument:
+        return Decimal("0.01")
+    if instrument.endswith("_JPY"):
+        return Decimal("0.01")
+    return Decimal("0.0001")
 
 def fmt_price_decimal(x: Decimal, instrument: str) -> str:
     places = Decimal("0.001") if instrument.endswith("_JPY") else Decimal("0.00001")
