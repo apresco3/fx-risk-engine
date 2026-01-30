@@ -841,6 +841,11 @@ def execute_open_trade(
 
     # 1. Spread Gate (Avoid trading during news spikes/rollover)
     if MAX_SPREAD_PIPS > 0:
+        # Define dynamic max spread based on asset class
+        current_max_spread = MAX_SPREAD_PIPS
+        if "XAU" in pair:
+            current_max_spread = 60.0  # Allow up to 60 pips ($0.60) for Gold
+        
         if spread_pips_val is None:
             db_record_execution(
                 alert_id=alert_id, action="open", instrument=pair, side=side,
@@ -851,7 +856,7 @@ def execute_open_trade(
             )
             return {"status": "RISK_BLOCKED_PRICE_FETCH_FAIL"}, 503
 
-        if spread_pips_val > MAX_SPREAD_PIPS:
+        if spread_pips_val > current_max_spread:
             db_record_execution(
                 alert_id=alert_id, action="open", instrument=pair, side=side,
                 units=None, sl_pips=sl_pips, tp_pips=tp_pips,
@@ -859,7 +864,7 @@ def execute_open_trade(
                 status="RISK_BLOCKED_SPREAD", oanda_http=None, oanda_response=None,
                 meta=json.dumps(meta)
             )
-            return {"status": "RISK_BLOCKED_SPREAD", "spread_pips": spread_pips_val, "cap": MAX_SPREAD_PIPS}, 403
+            return {"status": "RISK_BLOCKED_SPREAD", "spread_pips": spread_pips_val, "cap": current_max_spread}, 403
 
     # 2. Daily Loss Limit (Circuit Breaker)
     if DAILY_LOSS_LIMIT_USD > 0:
@@ -1250,10 +1255,15 @@ def webhook():
             except Exception:
                 pass
 
+        # Determine dynamic spread limit for GPT context
+        dynamic_spread_limit = MAX_SPREAD_PIPS
+        if "XAU" in pair:
+            dynamic_spread_limit = 60.0
+
         # GPT context includes the new lookback array automatically (inside features)
         gpt_ctx = {
             "pair": pair,
-            "features": features,  # includes lookback
+            "features": features,
             "hint": {"sl_pips": hint_sl, "tp_pips": hint_tp},
             "limits": {
                 "min_sl_pips": MIN_SL_PIPS,
@@ -1261,9 +1271,10 @@ def webhook():
                 "max_tp_pips": MAX_TP_PIPS,
                 "max_units": MAX_UNITS,
                 "max_net_units": MAX_NET_UNITS,
-                "max_spread_pips": MAX_SPREAD_PIPS,
+                "max_spread_pips": dynamic_spread_limit, # <--- FIXED (Sends 60.0 for Gold)
                 "gpt_max_units_mult": GPT_MAX_UNITS_MULT
             },
+            # ... (rest of dict stays same)
             "state": {
                 "spread_pips": spread_pips_val,
                 "current_net": current_net
