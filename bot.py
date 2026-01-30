@@ -153,7 +153,8 @@ def gpt_decide_trade(context: dict) -> dict:
 
             "Hard Constraints:\n"
             "- Action=HOLD if spread > max_spread_pips or spread is null.\n"
-            "- Action=OPEN is strictly prohibited if state.current_net != 0.\n"
+            "- Total Net Position Constraint: You MAY add to a position (pyramid) ONLY IF abs(state.current_net + units_calculated) <= limits.max_net_units.\n"
+            "- Scaling Rule: If state.current_net > 0 (Long), ONLY OPEN 'buy'. If < 0 (Short), ONLY OPEN 'sell'. Do NOT hedge.\n"
             "- sl_pips must be in [limits.min_sl_pips, limits.max_sl_pips].\n"
             "- tp_pips must be in [10, limits.max_tp_pips]. (Safety: Minimum 10 pips).\n\n"
 
@@ -161,6 +162,14 @@ def gpt_decide_trade(context: dict) -> dict:
             "1. Setup A (Cross): Cross detected + Momentum Confirmation + ADX/SEP filters met.\n"
             "2. Setup B (Continuation): ADX >= 22 + Trend/Slope match + Lookback consistency.\n"
             "3. Sizing: units_mult = 1.0. Reduce to 0.5 if ADX [15-17], low separation, or weak momentum confirmation.\n\n"
+
+            "CLOSE rules (allowed to close):\n"
+            "- If state.current_net > 0 (long):\n"
+            "    * CLOSE if features.trendDown is true (trend flipped) OR features.sellCross is true OR features.adx < 14.\n"
+            "    * Else HOLD.\n"
+            "- If state.current_net < 0 (short):\n"
+            "    * CLOSE if features.trendUp is true (trend flipped) OR features.buyCross is true OR features.adx < 14.\n"
+            "    * Else HOLD.\n\n"
 
             "Confidence:\n"
             "- Perfect alignment: >= 0.75.\n"
@@ -781,6 +790,34 @@ def validate_payload(data: dict):
     }, None
 
 # ============================================================
+# Pyramiding Cool-Down Helper
+# ============================================================
+def check_cooldown(instrument: str, cooldown_minutes: int) -> bool:
+    """Returns True if we are allowed to trade (cooldown expired), False otherwise."""
+    if cooldown_minutes <= 0:
+        return True
+        
+    conn = db_conn()
+    cur = conn.cursor()
+    # Find the last successful OPEN for this instrument
+    cur.execute("""
+        SELECT ts FROM executions 
+        WHERE instrument = ? AND action = 'open' AND status = 'OK'
+        ORDER BY ts DESC LIMIT 1
+    """, (instrument,))
+    row = cur.fetchone()
+    conn.close()
+    
+    if not row:
+        return True # No previous trades, safe to trade
+        
+    last_ts = row["ts"]
+    now = int(time.time())
+    elapsed_minutes = (now - last_ts) / 60.0
+    
+    return elapsed_minutes >= cooldown_minutes
+
+# ============================================================
 # Core execution helper
 # ============================================================
 def execute_open_trade(
@@ -798,7 +835,7 @@ def execute_open_trade(
     meta: dict
 ) -> Tuple[Dict[str, Any], int]:
 
-    # Spread gate (OPEN only)
+    # 1. Spread Gate (Avoid trading during news spikes/rollover)
     if MAX_SPREAD_PIPS > 0:
         if spread_pips_val is None:
             db_record_execution(
@@ -820,7 +857,7 @@ def execute_open_trade(
             )
             return {"status": "RISK_BLOCKED_SPREAD", "spread_pips": spread_pips_val, "cap": MAX_SPREAD_PIPS}, 403
 
-    # Daily loss cap
+    # 2. Daily Loss Limit (Circuit Breaker)
     if DAILY_LOSS_LIMIT_USD > 0:
         day_start_nav = get_day_start_nav(nav)
         if day_start_nav - nav >= DAILY_LOSS_LIMIT_USD:
@@ -838,19 +875,26 @@ def execute_open_trade(
                 "limit": str(DAILY_LOSS_LIMIT_USD)
             }, 403
 
-    # Risk sizing based on sl_pips
+    # 3. Position Sizing Logic (Risk % + GPT Scale + Min/Max Constraints)
+    # A. Base risk calculation (e.g. 0.25% of Equity)
     units = compute_units_from_risk(instrument=pair, sl_pips=sl_pips, nav=nav, account_ccy=acct_ccy)
 
-    # Apply GPT reduction
+    # B. Apply GPT Probability Multiplier (e.g. 0.5x if confidence is lower)
     units_mult = max(0.1, min(float(units_mult), GPT_MAX_UNITS_MULT))
-    units = max(1, int(units * units_mult))
+    units = int(units * units_mult)
+    
+    # C. Enforce Hard Floor (Minimum $10 or 10 units) & Ceiling (Max Units)
+    min_units = int(os.getenv("MIN_TRADE_UNITS", "10"))
+    units = max(min_units, units) 
     units = min(units, MAX_UNITS)
 
-    # Absolute max-risk gate
+    # 4. Absolute Max Risk Gate (Double check money at risk vs max dollar limit)
     loss_unit = loss_per_unit_home(instrument=pair, sl_pips=sl_pips, account_ccy=acct_ccy)
     expected_loss = loss_unit * Decimal(units)
     max_loss = min(nav, MAX_RISK_USD)
+    
     if expected_loss > max_loss:
+        # If min_units forces risk above MAX_RISK_USD, block the trade
         db_record_execution(
             alert_id=alert_id, action="open", instrument=pair, side=side,
             units=units, sl_pips=sl_pips, tp_pips=tp_pips,
@@ -860,10 +904,10 @@ def execute_open_trade(
         )
         return {"status": "RISK_BLOCKED_MAX_RISK_USD", "expected_loss": str(expected_loss), "cap": str(max_loss)}, 403
 
+    # 5. Net Exposure Gate (Pyramiding Safety)
     signed_units = -units if side == "sell" else units
     projected_net = current_net + signed_units
 
-    # Net exposure gate
     if abs(projected_net) > MAX_NET_UNITS:
         db_record_execution(
             alert_id=alert_id, action="open", instrument=pair, side=side,
@@ -874,7 +918,7 @@ def execute_open_trade(
         )
         return {"status": "RISK_BLOCKED_MAX_NET_UNITS", "current_net": current_net, "projected_net": projected_net, "cap": MAX_NET_UNITS}, 403
 
-    # Place order
+    # 6. Execute Order
     try:
         r = place_market_order(instrument=pair, signed_units=signed_units, sl_pips=sl_pips, tp_pips=tp_pips)
         ok = r.ok
@@ -898,7 +942,7 @@ def execute_open_trade(
             meta=json.dumps(meta)
         )
 
-        # Update trade_state (entry price from fill if present; else use current mid)
+        # 7. Update Trade State (Local Tracking)
         entry_price = None
         try:
             if resp_json:
@@ -915,12 +959,14 @@ def execute_open_trade(
                 entry_price = None
 
         if ok and entry_price is not None:
+            # We track the new "weighted average" entry implicitly by updating the net unit count and last price.
+            # OANDA handles the actual average price on their backend.
             upsert_trade_state(
                 instrument=pair,
                 is_open=True,
                 side=side,
-                units=units,
-                entry_price=entry_price,
+                units=abs(projected_net), # Update to new total units
+                entry_price=entry_price,  # This updates the "last entry" price reference
                 entry_time_ms=int(time.time() * 1000),
                 last_mark_price=entry_price,
                 unrealized_pl_home=Decimal(0),
@@ -953,7 +999,6 @@ def execute_open_trade(
             meta=json.dumps(meta)
         )
         return {"status": "NETWORK_ERROR", "error": str(e)}, 502
-
 
 # ============================================================
 # Routes
@@ -1314,20 +1359,34 @@ def webhook():
                 )
                 return {"status": "ERROR", "action": "close", "error": str(e), "decision": gpt_decision}, 502
 
+        # DELETE OR COMMENT OUT THIS BLOCK TO ALLOW MULTIPLE POSITIONS
         # One-position-at-a-time: block OPEN if already in position
-        if gpt_decision["action"] == "OPEN" and current_net != 0:
-            log(f"GPT_HOLD_ALREADY_IN_POSITION | alert_id={alert_id} | {pair} | net={current_net} | {gpt_decision}")
-            db_record_execution(
-                alert_id=alert_id, action="observe", instrument=pair,
-                side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
-                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                status="GPT_HOLD_ALREADY_IN_POSITION", oanda_http=None, oanda_response=None,
-                meta=json.dumps(gpt_decision)
-            )
-            return {"status": "GPT_HOLD_ALREADY_IN_POSITION", "decision": gpt_decision}, 200
+        # if gpt_decision["action"] == "OPEN" and current_net != 0:
+        #     log(f"GPT_HOLD_ALREADY_IN_POSITION | alert_id={alert_id} | {pair} | net={current_net} | {gpt_decision}")
+        #     db_record_execution(
+        #         alert_id=alert_id, action="observe", instrument=pair,
+        #         side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
+        #         current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+        #         status="GPT_HOLD_ALREADY_IN_POSITION", oanda_http=None, oanda_response=None,
+        #         meta=json.dumps(gpt_decision)
+        #     )
+        #     return {"status": "GPT_HOLD_ALREADY_IN_POSITION", "decision": gpt_decision}, 200
 
         # OPEN (only when flat)
         if gpt_decision["action"] == "OPEN":
+            # --- NEW: PYRAMIDING COOL-DOWN CHECK ---
+            cooldown_min = int(os.getenv("PYRAMID_COOLDOWN_MINUTES", "15"))
+            if current_net != 0 and not check_cooldown(pair, cooldown_min):
+                log(f"COOLDOWN_ACTIVE | alert_id={alert_id} | {pair} | Last trade too recent (<{cooldown_min}m)")
+                db_record_execution(
+                    alert_id=alert_id, action="observe", instrument=pair,
+                    side=None, units=None, sl_pips=None, tp_pips=None,
+                    current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+                    status="COOLDOWN_ACTIVE", oanda_http=None, oanda_response=None,
+                    meta=json.dumps(gpt_decision)
+                )
+                return {"status": "COOLDOWN_ACTIVE", "wait_minutes": cooldown_min}, 200
+            
             side = gpt_decision["side"]
             if side not in ("buy", "sell"):
                 db_record_execution(
