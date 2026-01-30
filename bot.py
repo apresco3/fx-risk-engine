@@ -3,8 +3,10 @@ from dotenv import load_dotenv
 import requests
 import datetime
 import os
+import time
+from collections import OrderedDict
 
-# Load environment variables
+# Load environment variables from .env
 load_dotenv()
 
 app = Flask(__name__)
@@ -30,25 +32,57 @@ BASE_URL = (
 )
 
 # =====================
+# Duplicate protection
+# =====================
+SEEN = OrderedDict()
+SEEN_TTL_SECONDS = 60   # Ignore duplicate alert_id within 60 seconds
+SEEN_MAX_SIZE = 5000    # Prevent unbounded growth
+
+def seen_before(alert_id: str) -> bool:
+    now = time.time()
+
+    # Prune old entries
+    while SEEN:
+        oldest_id, ts = next(iter(SEEN.items()))
+        if now - ts > SEEN_TTL_SECONDS:
+            SEEN.popitem(last=False)
+        else:
+            break
+
+    # Check duplicate
+    if alert_id in SEEN:
+        return True
+
+    # Record new
+    SEEN[alert_id] = now
+    if len(SEEN) > SEEN_MAX_SIZE:
+        SEEN.popitem(last=False)
+
+    return False
+
+# =====================
 # Helpers
 # =====================
 def log(msg: str):
     with open("trades.log", "a") as f:
         f.write(f"{datetime.datetime.now().isoformat()} | {msg}\n")
 
-
 def risk_check(units: int) -> bool:
     return abs(units) <= MAX_UNITS
 
-
 def validate_payload(data: dict):
-    side = str(data.get("side", "")).lower()
-    pair = str(data.get("pair", "")).upper()
+    alert_id = str(data.get("alert_id", "")).strip()
+    side = str(data.get("side", "")).lower().strip()
+    pair = str(data.get("pair", "")).upper().strip()
     units = data.get("units")
 
-    if side not in {"buy", "sell"}:
-        return None, "Invalid side"
+    if not alert_id:
+        return None, "Missing alert_id"
 
+    if side not in {"buy", "sell"}:
+        return None, "Invalid side (must be 'buy' or 'sell')"
+
+    # OANDA instruments look like EUR_USD
     if "_" not in pair:
         return None, "Invalid pair format (use EUR_USD)"
 
@@ -60,7 +94,7 @@ def validate_payload(data: dict):
     if units <= 0:
         return None, "Units must be positive"
 
-    return {"side": side, "pair": pair, "units": units}, None
+    return {"alert_id": alert_id, "side": side, "pair": pair, "units": units}, None
 
 # =====================
 # Routes
@@ -72,7 +106,6 @@ def health():
         "mode": MODE,
         "trading_enabled": TRADING_ENABLED
     })
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -91,12 +124,17 @@ def webhook():
         log(f"BAD REQUEST | {err} | {data}")
         return {"status": "BAD_REQUEST", "error": err}, 400
 
+    alert_id = payload["alert_id"]
+    if seen_before(alert_id):
+        log(f"DUPLICATE IGNORED | alert_id={alert_id}")
+        return {"status": "DUPLICATE_IGNORED"}, 200
+
     side = payload["side"]
     pair = payload["pair"]
     units = payload["units"]
 
     if not risk_check(units):
-        log(f"RISK BLOCKED | {pair} {side} {units}")
+        log(f"RISK BLOCKED | alert_id={alert_id} | {pair} {side} {units}")
         return {"status": "RISK_BLOCKED"}, 403
 
     signed_units = -units if side == "sell" else units
@@ -125,7 +163,7 @@ def webhook():
         )
 
         body = r.json()
-        log(f"ORDER | {pair} {side} {signed_units} | HTTP {r.status_code}")
+        log(f"ORDER | alert_id={alert_id} | {pair} {side} {signed_units} | HTTP {r.status_code}")
 
         return {
             "status": "OK" if r.ok else "OANDA_ERROR",
@@ -134,9 +172,9 @@ def webhook():
         }, (200 if r.ok else 502)
 
     except requests.RequestException as e:
-        log(f"NETWORK ERROR | {repr(e)}")
+        log(f"NETWORK ERROR | alert_id={alert_id} | {repr(e)}")
         return {"status": "NETWORK_ERROR"}, 502
 
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    # Use debug=False to avoid Flask auto-reloader weirdness during trading
+    app.run(host="0.0.0.0", port=8080, debug=False)
