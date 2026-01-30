@@ -15,9 +15,9 @@ getcontext().prec = 28
 load_dotenv()
 app = Flask(__name__)
 
-# =====================
+# ============================================================
 # OpenAI (GPT gatekeeper)
-# =====================
+# ============================================================
 try:
     from openai import OpenAI
 except Exception:
@@ -39,13 +39,11 @@ GPT_TIMEOUT_SECONDS = float(os.getenv("GPT_TIMEOUT_SECONDS", "12"))
 openai_client = None
 if OpenAI and OPENAI_API_KEY:
     try:
-        # OpenAI Python SDK: Responses API, supports tools/function calling
         openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=GPT_TIMEOUT_SECONDS)
     except Exception:
         openai_client = None
 
 # Function tool schema (strict mode = schema-locked)
-# PATCH: use valid JSON Schema anyOf instead of enum containing None
 DECIDE_TRADE_TOOL = [
     {
         "type": "function",
@@ -79,7 +77,6 @@ DECIDE_TRADE_TOOL = [
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "reason": {"type": "string"}
             },
-            # strict mode requires all fields required (use null for optional values)
             "required": ["action", "side", "sl_pips", "tp_pips", "units_mult", "confidence", "reason"],
         }
     }
@@ -89,6 +86,10 @@ def _get_attr(obj, name, default=None):
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+def log(msg: str):
+    with open("trades.log", "a") as f:
+        f.write(f"{datetime.datetime.now().isoformat()} | {msg}\n")
 
 def gpt_decide_trade(context: dict) -> dict:
     """
@@ -102,10 +103,6 @@ def gpt_decide_trade(context: dict) -> dict:
         "confidence": float,
         "reason": str
       }
-
-    Fail behavior:
-      - GPT_FAIL_OPEN=true  -> HOLD (still conservative; you can change later)
-      - GPT_FAIL_OPEN=false -> fail-closed => HOLD
     """
     safe_hold = {
         "action": "HOLD",
@@ -123,73 +120,53 @@ def gpt_decide_trade(context: dict) -> dict:
         return safe_hold
 
     if not openai_client:
-        # No SDK or no key configured (or client init failed)
         if GPT_FAIL_OPEN:
             safe_hold["reason"] = "GPT_NO_CLIENT_FAIL_OPEN_BUT_HOLD"
             return safe_hold
         return safe_hold
 
-    # Your tuned policy (as you posted)
     instructions = (
-        "You are an FX execution gatekeeper. Output ONLY the decide_trade tool call.\n\n"
+            "You are an FX execution gatekeeper. Output ONLY the decide_trade tool call.\n\n"
 
-        "Interpretation of inputs:\n"
-        "- features.adx: trend strength\n"
-        "- features.ema_sep_pips: separation between fast/slow EMAs (small => chop)\n"
-        "- features.atr_pips: recent volatility in pips\n"
-        "- features.range_pips: current bar range in pips (very small => noise)\n"
-        "- features.buyCross / sellCross: EMA cross events\n"
-        "- features.trendUp / trendDown: fast EMA above/below slow EMA\n"
-        "- features.fast_slope_pips / slow_slope_pips: EMA slope direction\n\n"
+            "Context:\n"
+            "- You receive a current snapshot and a lookback sequence in features.lookback (array of recent candles).\n"
+            "- Distances to key levels and summary stats are provided; do NOT compute math.\n\n"
 
-        "Hard constraints (must obey):\n"
-        "- If state.spread_pips is null, or (limits.max_spread_pips>0 and state.spread_pips>limits.max_spread_pips): action=HOLD.\n"
-        "- units_mult must be <= limits.gpt_max_units_mult.\n"
-        "- sl_pips must be within [limits.min_sl_pips, limits.max_sl_pips] when action=OPEN.\n"
-        "- tp_pips must be within [0, limits.max_tp_pips] when action=OPEN.\n\n"
+            "Interpretation of inputs:\n"
+            "- state.current_net: 0=flat; >0 long; <0 short.\n"
+            "- state.spread_pips: Current spread (check against limits.max_spread_pips).\n"
+            "- features.adx: Trend strength (higher = stronger trend).\n"
+            "- features.ema_sep_pips: Fast/Slow EMA gap (small gap = chop).\n"
+            "- features.lookback: Sequence of last N candles for momentum inference.\n\n"
 
-        "Extra noise filter using range_pips:\n"
-        "- If features.range_pips < 2.0 AND features.adx < 18: action=HOLD.\n\n"
+            "Key Levels & Overextension Filters:\n"
+            "- features.dist_to_high_24h: Pips below 24h high. (BUY blocked if < 5 unless ADX >= 28).\n"
+            "- features.dist_to_low_24h: Pips above 24h low. (SELL blocked if < 5 unless ADX >= 28).\n"
+            "- features.dist_to_ema_200 (dMean): Signed pips from mean.\n"
+            "    * If abs(dMean) > 40 AND adx < 20: HOLD (Overextended).\n"
+            "    * If abs(dMean) > 60 AND adx < 28: HOLD (Severely Overextended).\n\n"
 
-        "Chop filter (avoid whipsaw):\n"
-        "- If features.adx < 15 AND features.ema_sep_pips < 1.2: action=HOLD.\n\n"
+            "Momentum Confirmation (Summary Stats):\n"
+            "- BUY Confirmation: rsi_change_3_bars > 0 AND price_change_3_bars_pips > 0.\n"
+            "- SELL Confirmation: rsi_change_3_bars < 0 AND price_change_3_bars_pips < 0.\n"
+            "- Lookback Inference: Predominant direction of last 5 candles must match trade side.\n\n"
 
-        "OPEN rules (trade relatively often but not random):\n"
-        "- If state.current_net == 0:\n"
-        "    * If features.buyCross is true AND (features.adx >= 16 OR features.ema_sep_pips >= 1.5): action=OPEN, side=buy.\n"
-        "    * Else if features.sellCross is true AND (features.adx >= 16 OR features.ema_sep_pips >= 1.5): action=OPEN, side=sell.\n"
-        "    * Else if features.adx >= 22 AND features.trendUp is true AND features.fast_slope_pips > 0 AND features.slow_slope_pips > 0: action=OPEN, side=buy.\n"
-        "    * Else if features.adx >= 22 AND features.trendDown is true AND features.fast_slope_pips < 0 AND features.slow_slope_pips < 0: action=OPEN, side=sell.\n"
-        "    * Else action=HOLD.\n\n"
+            "Hard Constraints:\n"
+            "- Action=HOLD if spread > max_spread_pips or spread is null.\n"
+            "- Action=OPEN is strictly prohibited if state.current_net != 0.\n"
+            "- sl_pips must be in [limits.min_sl_pips, limits.max_sl_pips].\n"
+            "- tp_pips must be in [10, limits.max_tp_pips]. (Safety: Minimum 10 pips).\n\n"
 
-        "CLOSE rules (GPT is allowed to close):\n"
-        "- If state.current_net > 0 (currently long):\n"
-        "    * If features.sellCross is true: action=CLOSE.\n"
-        "    * Else if features.adx < 14: action=CLOSE.\n"
-        "    * Else action=HOLD.\n"
-        "- If state.current_net < 0 (currently short):\n"
-        "    * If features.buyCross is true: action=CLOSE.\n"
-        "    * Else if features.adx < 14: action=CLOSE.\n"
-        "    * Else action=HOLD.\n\n"
+            "Execution Logic:\n"
+            "1. Setup A (Cross): Cross detected + Momentum Confirmation + ADX/SEP filters met.\n"
+            "2. Setup B (Continuation): ADX >= 22 + Trend/Slope match + Lookback consistency.\n"
+            "3. Sizing: units_mult = 1.0. Reduce to 0.5 if ADX [15-17], low separation, or weak momentum confirmation.\n\n"
 
-        "SL/TP selection (use ATR when available):\n"
-        "- If features.atr_pips is present and > 0:\n"
-        "    * sl_pips = round(clamp(1.4 * atr_pips, limits.min_sl_pips, limits.max_sl_pips)).\n"
-        "    * tp_pips = round(clamp(2.0 * sl_pips, 0, limits.max_tp_pips)).\n"
-        "- Else:\n"
-        "    * sl_pips = clamp(hint.sl_pips, limits.min_sl_pips, limits.max_sl_pips).\n"
-        "    * tp_pips = clamp(hint.tp_pips, 0, limits.max_tp_pips).\n\n"
-
-        "Sizing modifier (only reduce size):\n"
-        "- Default units_mult = 1.0.\n"
-        "- If features.adx is between 15 and 17 or ema_sep_pips is between 1.2 and 1.5: units_mult = 0.5.\n\n"
-
-        "Confidence:\n"
-        "- If OPEN via buyCross/sellCross with adx>=18: confidence>=0.70.\n"
-        "- If OPEN via trend continuation rule (adx>=22): confidence>=0.75.\n"
-        "- If HOLD due to chop/spread/noise: confidence can be 0.6-0.9.\n"
-        "- If unsure: action=HOLD, confidence<=0.55.\n"
-    )
+            "Confidence:\n"
+            "- Perfect alignment: >= 0.75.\n"
+            "- Trend continuation: >= 0.70.\n"
+            "- Uncertain/Chop/Blocked: HOLD with confidence <= 0.55."
+        )
 
     try:
         resp = openai_client.responses.create(
@@ -227,7 +204,7 @@ def gpt_decide_trade(context: dict) -> dict:
                 confidence = float(out.get("confidence", 0.0))
                 confidence = max(0.0, min(confidence, 1.0))
 
-                reason = str(out.get("reason", "")).strip()[:500]
+                reason = str(out.get("reason", "")).strip()[:1200]
 
                 return {
                     "action": action,
@@ -245,9 +222,10 @@ def gpt_decide_trade(context: dict) -> dict:
         safe_hold["reason"] = f"GPT_ERROR_FAIL_CLOSED: {repr(e)}"
         return safe_hold
 
-# =====================
+
+# ============================================================
 # Config
-# =====================
+# ============================================================
 OANDA_TOKEN = os.getenv("OANDA_TOKEN")
 ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 MODE = os.getenv("OANDA_MODE", "PRACTICE").upper()
@@ -255,26 +233,21 @@ MODE = os.getenv("OANDA_MODE", "PRACTICE").upper()
 WEBHOOK_KEY = os.getenv("WEBHOOK_KEY", "")
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 
-# Risk caps
 MAX_UNITS = int(os.getenv("MAX_UNITS", "1000"))
 MAX_NET_UNITS = int(os.getenv("MAX_NET_UNITS", "2000"))
 
 # Stale alert guard (0 disables)
 MAX_ALERT_AGE_SECONDS = int(os.getenv("MAX_ALERT_AGE_SECONDS", "0"))
 
-# Bracket defaults (pips)
 SL_PIPS_DEFAULT = int(os.getenv("SL_PIPS", "20"))
 TP_PIPS_DEFAULT = int(os.getenv("TP_PIPS", "40"))
 
-# Hard caps for brackets (pips)
 MAX_SL_PIPS = int(os.getenv("MAX_SL_PIPS", str(SL_PIPS_DEFAULT)))
 MAX_TP_PIPS = int(os.getenv("MAX_TP_PIPS", str(TP_PIPS_DEFAULT)))
 MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "1"))
 
-# Spread filter
-MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))   # 0 disables
+MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))
 
-# Equity sizing
 RISK_PCT = Decimal(os.getenv("RISK_PCT", "0.0025"))
 MAX_RISK_USD = Decimal(os.getenv("MAX_RISK_USD", "100"))
 DAILY_LOSS_LIMIT_USD = Decimal(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))
@@ -282,11 +255,8 @@ DAILY_LOSS_LIMIT_USD = Decimal(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))
 FORCE_RISK_SIZING = os.getenv("FORCE_RISK_SIZING", "true").lower() == "true"
 ALLOW_NONQUOTE_HOME_SIZING = os.getenv("ALLOW_NONQUOTE_HOME_SIZING", "false").lower() == "true"
 
-# Persistent state
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "60"))
-
-# Server
 PORT = int(os.getenv("PORT", "8080"))
 
 if not OANDA_TOKEN or not ACCOUNT_ID:
@@ -303,9 +273,9 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# =====================
+# ============================================================
 # DB setup + migration
-# =====================
+# ============================================================
 def db_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -343,6 +313,22 @@ def db_init():
         );
     """)
 
+    # New: current position snapshot
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trade_state (
+            instrument TEXT PRIMARY KEY,
+            is_open INTEGER NOT NULL,
+            side TEXT,
+            units INTEGER,
+            entry_price TEXT,
+            entry_time_ms INTEGER,
+            last_mark_price TEXT,
+            unrealized_pl_home TEXT,
+            realized_pl_home TEXT,
+            last_update_ts INTEGER
+        );
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_state (
             day TEXT PRIMARY KEY,
@@ -350,6 +336,7 @@ def db_init():
         );
     """)
 
+    # migrations for older DBs
     cur.execute("PRAGMA table_info(executions);")
     cols = {row["name"] for row in cur.fetchall()}
     if "meta" not in cols:
@@ -360,13 +347,9 @@ def db_init():
 
 db_init()
 
-# =====================
-# Logging
-# =====================
-def log(msg: str):
-    with open("trades.log", "a") as f:
-        f.write(f"{datetime.datetime.now().isoformat()} | {msg}\n")
-
+# ============================================================
+# DB helpers
+# ============================================================
 def db_record_execution(**kwargs):
     conn = db_conn()
     cur = conn.cursor()
@@ -396,15 +379,69 @@ def db_record_execution(**kwargs):
     conn.commit()
     conn.close()
 
-# =====================
+def get_trade_state(instrument: str) -> dict:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM trade_state WHERE instrument = ?", (instrument,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+def upsert_trade_state(
+    *,
+    instrument: str,
+    is_open: bool,
+    side: Optional[str],
+    units: Optional[int],
+    entry_price: Optional[Decimal],
+    entry_time_ms: Optional[int],
+    last_mark_price: Optional[Decimal],
+    unrealized_pl_home: Optional[Decimal],
+    realized_pl_home: Optional[Decimal]
+):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO trade_state (
+            instrument, is_open, side, units, entry_price, entry_time_ms,
+            last_mark_price, unrealized_pl_home, realized_pl_home, last_update_ts
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(instrument) DO UPDATE SET
+            is_open=excluded.is_open,
+            side=excluded.side,
+            units=excluded.units,
+            entry_price=excluded.entry_price,
+            entry_time_ms=excluded.entry_time_ms,
+            last_mark_price=excluded.last_mark_price,
+            unrealized_pl_home=excluded.unrealized_pl_home,
+            realized_pl_home=excluded.realized_pl_home,
+            last_update_ts=excluded.last_update_ts;
+    """, (
+        instrument,
+        1 if is_open else 0,
+        side,
+        units,
+        (str(entry_price) if entry_price is not None else None),
+        entry_time_ms,
+        (str(last_mark_price) if last_mark_price is not None else None),
+        (str(unrealized_pl_home) if unrealized_pl_home is not None else None),
+        (str(realized_pl_home) if realized_pl_home is not None else None),
+        int(time.time())
+    ))
+    conn.commit()
+    conn.close()
+
+# ============================================================
 # Dedupe
-# =====================
+# ============================================================
 def seen_before(alert_id: str) -> bool:
     now = int(time.time())
     cutoff = now - ALERT_TTL_SECONDS
 
     conn = db_conn()
     cur = conn.cursor()
+
     cur.execute("DELETE FROM alerts WHERE first_seen_ts < ?", (cutoff,))
     cur.execute("SELECT first_seen_ts FROM alerts WHERE alert_id = ?", (alert_id,))
     row = cur.fetchone()
@@ -418,9 +455,9 @@ def seen_before(alert_id: str) -> bool:
     conn.close()
     return False
 
-# =====================
+# ============================================================
 # OANDA helpers
-# =====================
+# ============================================================
 def pip_size_for(instrument: str) -> Decimal:
     return Decimal("0.01") if instrument.endswith("_JPY") else Decimal("0.0001")
 
@@ -430,6 +467,53 @@ def fmt_price_decimal(x: Decimal, instrument: str) -> str:
 
 def oanda_get_open_positions():
     return requests.get(f"{BASE_URL}/accounts/{ACCOUNT_ID}/openPositions", headers=HEADERS, timeout=10)
+
+def oanda_get_pricing(instrument: str):
+    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing"
+    params = {"instruments": instrument}
+    return requests.get(url, headers=HEADERS, params=params, timeout=10)
+
+def oanda_get_account_summary():
+    return requests.get(f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary", headers=HEADERS, timeout=10)
+
+def get_account_nav_and_currency():
+    r = oanda_get_account_summary()
+    if not r.ok:
+        raise RuntimeError(f"Failed to fetch account summary: HTTP {r.status_code} {r.text}")
+    acct = r.json().get("account", {})
+    nav = Decimal(acct.get("NAV", acct.get("balance", "0")))
+    currency = str(acct.get("currency", "USD")).upper()
+    return nav, currency
+
+def get_spread_pips(instrument: str) -> float:
+    r = oanda_get_pricing(instrument)
+    if not r.ok:
+        raise RuntimeError(f"Failed to fetch pricing: HTTP {r.status_code} {r.text}")
+    data = r.json()
+    prices = data.get("prices", [])
+    if not prices:
+        raise RuntimeError("No pricing data returned")
+
+    p = prices[0]
+    bid = Decimal(p["bids"][0]["price"])
+    ask = Decimal(p["asks"][0]["price"])
+    spread = ask - bid
+    pip = pip_size_for(instrument)
+    return float(spread / pip)
+
+def get_mid_price(instrument: str) -> Decimal:
+    r = oanda_get_pricing(instrument)
+    if not r.ok:
+        raise RuntimeError(f"Failed to fetch pricing: HTTP {r.status_code} {r.text}")
+    data = r.json()
+    prices = data.get("prices", [])
+    if not prices:
+        raise RuntimeError("No pricing data returned")
+
+    p = prices[0]
+    bid = Decimal(p["bids"][0]["price"])
+    ask = Decimal(p["asks"][0]["price"])
+    return (bid + ask) / Decimal(2)
 
 def get_net_units_for_instrument(instrument: str) -> int:
     r = oanda_get_open_positions()
@@ -443,40 +527,6 @@ def get_net_units_for_instrument(instrument: str) -> int:
             short_units = int(pos.get("short", {}).get("units", "0"))
             return long_units + short_units
     return 0
-
-def oanda_get_pricing(instrument: str):
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing"
-    params = {"instruments": instrument}
-    return requests.get(url, headers=HEADERS, params=params, timeout=10)
-
-def get_spread_pips(instrument: str) -> float:
-    r = oanda_get_pricing(instrument)
-    if not r.ok:
-        raise RuntimeError(f"Failed to fetch pricing: HTTP {r.status_code} {r.text}")
-
-    data = r.json()
-    prices = data.get("prices", [])
-    if not prices:
-        raise RuntimeError("No pricing data returned")
-
-    p = prices[0]
-    bid = Decimal(p["bids"][0]["price"])
-    ask = Decimal(p["asks"][0]["price"])
-    spread = ask - bid
-    pip = pip_size_for(instrument)
-    return float(spread / pip)
-
-def oanda_get_account_summary():
-    return requests.get(f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary", headers=HEADERS, timeout=10)
-
-def get_account_nav_and_currency():
-    r = oanda_get_account_summary()
-    if not r.ok:
-        raise RuntimeError(f"Failed to fetch account summary: HTTP {r.status_code} {r.text}")
-    acct = r.json().get("account", {})
-    nav = Decimal(acct.get("NAV", acct.get("balance", "0")))
-    currency = str(acct.get("currency", "USD")).upper()
-    return nav, currency
 
 def get_day_start_nav(nav_now: Decimal) -> Decimal:
     day = datetime.datetime.utcnow().date().isoformat()
@@ -570,11 +620,67 @@ def place_market_order(*, instrument: str, signed_units: int, sl_pips: int, tp_p
         timeout=10
     )
 
-# =====================
+# ============================================================
+# PnL helpers
+# ============================================================
+def quote_to_home_mid(quote_ccy: str, home_ccy: str) -> Optional[Decimal]:
+    if quote_ccy == home_ccy:
+        return Decimal(1)
+
+    if not ALLOW_NONQUOTE_HOME_SIZING:
+        return None
+
+    quote_home = f"{quote_ccy}_{home_ccy}"
+    home_quote = f"{home_ccy}_{quote_ccy}"
+
+    try:
+        r = oanda_get_pricing(quote_home)
+        if r.ok and r.json().get("prices"):
+            p = r.json()["prices"][0]
+            bid = Decimal(p["bids"][0]["price"])
+            ask = Decimal(p["asks"][0]["price"])
+            return (bid + ask) / Decimal(2)
+    except Exception:
+        pass
+
+    r2 = oanda_get_pricing(home_quote)
+    if not r2.ok or not r2.json().get("prices"):
+        return None
+    p2 = r2.json()["prices"][0]
+    bid2 = Decimal(p2["bids"][0]["price"])
+    ask2 = Decimal(p2["asks"][0]["price"])
+    mid2 = (bid2 + ask2) / Decimal(2)   # 1 home = mid2 quote
+    return Decimal(1) / mid2            # 1 quote = 1/mid2 home
+
+def compute_unrealized_pl_home(
+    instrument: str,
+    side: str,
+    units: int,
+    entry_price: Decimal,
+    mark_price: Decimal,
+    account_ccy: str
+) -> Optional[Decimal]:
+    # P/L in quote currency then convert
+    _, quote = instrument.split("_")
+    u = abs(int(units))
+    if u == 0:
+        return Decimal(0)
+
+    if side == "buy":
+        pl_quote = (mark_price - entry_price) * Decimal(u)
+    else:
+        pl_quote = (entry_price - mark_price) * Decimal(u)
+
+    conv = quote_to_home_mid(quote, account_ccy)
+    if conv is None:
+        return None
+    return pl_quote * conv
+
+# ============================================================
 # Risk sizing
-# =====================
+# ============================================================
 def loss_per_unit_home(*, instrument: str, sl_pips: int, account_ccy: str) -> Decimal:
-    base, quote = instrument.split("_")
+    _, quote = instrument.split("_")
     pip = pip_size_for(instrument)
     sl_dist_quote = pip * Decimal(sl_pips)
 
@@ -584,41 +690,13 @@ def loss_per_unit_home(*, instrument: str, sl_pips: int, account_ccy: str) -> De
     if quote == account_ccy:
         return sl_dist_quote
 
-    if not ALLOW_NONQUOTE_HOME_SIZING:
+    conv = quote_to_home_mid(quote, account_ccy)
+    if conv is None:
         raise RuntimeError(
             f"Cannot risk-size safely: quote={quote} != account_ccy={account_ccy}. "
             f"Set ALLOW_NONQUOTE_HOME_SIZING=true to allow approximate conversion."
         )
-
-    quote_home = f"{quote}_{account_ccy}"
-    home_quote = f"{account_ccy}_{quote}"
-
-    conv = None
-    try:
-        r = oanda_get_pricing(quote_home)
-        if r.ok and r.json().get("prices"):
-            p = r.json()["prices"][0]
-            bid = Decimal(p["bids"][0]["price"])
-            ask = Decimal(p["asks"][0]["price"])
-            conv = (bid + ask) / Decimal(2)
-    except Exception:
-        conv = None
-
-    if conv is None:
-        r2 = oanda_get_pricing(home_quote)
-        if not r2.ok or not r2.json().get("prices"):
-            raise RuntimeError(f"Failed to obtain conversion rate {quote}<->{account_ccy}")
-        p2 = r2.json()["prices"][0]
-        bid2 = Decimal(p2["bids"][0]["price"])
-        ask2 = Decimal(p2["asks"][0]["price"])
-        mid2 = (bid2 + ask2) / Decimal(2)
-        conv = Decimal(1) / mid2
-
-    loss_unit_home = sl_dist_quote * conv
-    if loss_unit_home <= 0:
-        raise RuntimeError("Computed invalid loss_per_unit_home")
-
-    return loss_unit_home
+    return sl_dist_quote * conv
 
 def compute_units_from_risk(*, instrument: str, sl_pips: int, nav: Decimal, account_ccy: str) -> int:
     loss_unit = loss_per_unit_home(instrument=instrument, sl_pips=sl_pips, account_ccy=account_ccy)
@@ -626,10 +704,23 @@ def compute_units_from_risk(*, instrument: str, sl_pips: int, nav: Decimal, acco
     units = int((risk_budget_home / loss_unit).to_integral_value(rounding=ROUND_DOWN))
     return max(1, units)
 
-# =====================
+# ============================================================
 # Validation
-# =====================
+# ============================================================
 def validate_payload(data: dict):
+    """
+    OBSERVE (TradingView):
+      {"alert_id":"...", "action":"observe", "pair":"USD_JPY", "sl_pips":25, "tp_pips":50, "features":{...}}
+
+    Manual OPEN (optional):
+      {"alert_id":"...", "action":"open", "side":"buy|sell", "pair":"USD_JPY", "sl_pips":25, "tp_pips":50}
+
+    CLOSE (single):
+      {"alert_id":"...", "action":"close", "pair":"USD_JPY"}
+
+    CLOSE_ALL:
+      {"alert_id":"...", "action":"close_all"}
+    """
     alert_id = str(data.get("alert_id", "")).strip()
     action = str(data.get("action", "observe")).lower().strip()
     pair = str(data.get("pair", "")).upper().strip()
@@ -689,9 +780,9 @@ def validate_payload(data: dict):
         "features": features
     }, None
 
-# =====================
+# ============================================================
 # Core execution helper
-# =====================
+# ============================================================
 def execute_open_trade(
     *,
     alert_id: str,
@@ -788,6 +879,14 @@ def execute_open_trade(
         r = place_market_order(instrument=pair, signed_units=signed_units, sl_pips=sl_pips, tp_pips=tp_pips)
         ok = r.ok
 
+        body_text = r.text
+        resp_json = {}
+        try:
+            if r.headers.get("Content-Type", "").startswith("application/json"):
+                resp_json = r.json()
+        except Exception:
+            resp_json = {}
+
         log(f"OPEN | alert_id={alert_id} | {pair} {side} {signed_units} | net={current_net}->{projected_net} | SL={sl_pips} TP={tp_pips} | spread={spread_pips_val} | HTTP {r.status_code}")
 
         db_record_execution(
@@ -795,9 +894,38 @@ def execute_open_trade(
             units=units, sl_pips=sl_pips, tp_pips=tp_pips,
             current_net=current_net, projected_net=projected_net, spread_pips=spread_pips_val,
             oanda_http=r.status_code, status=("OK" if ok else "OANDA_ERROR"),
-            oanda_response=r.text,
+            oanda_response=body_text,
             meta=json.dumps(meta)
         )
+
+        # Update trade_state (entry price from fill if present; else use current mid)
+        entry_price = None
+        try:
+            if resp_json:
+                oft = resp_json.get("orderFillTransaction", {})
+                if isinstance(oft, dict) and "price" in oft:
+                    entry_price = Decimal(str(oft["price"]))
+        except Exception:
+            entry_price = None
+
+        if entry_price is None:
+            try:
+                entry_price = get_mid_price(pair)
+            except Exception:
+                entry_price = None
+
+        if ok and entry_price is not None:
+            upsert_trade_state(
+                instrument=pair,
+                is_open=True,
+                side=side,
+                units=units,
+                entry_price=entry_price,
+                entry_time_ms=int(time.time() * 1000),
+                last_mark_price=entry_price,
+                unrealized_pl_home=Decimal(0),
+                realized_pl_home=None
+            )
 
         return {
             "status": "OK" if ok else "OANDA_ERROR",
@@ -813,7 +941,7 @@ def execute_open_trade(
             "tp_pips": tp_pips,
             "spread_pips": spread_pips_val,
             "meta": meta,
-            "response": (r.json() if r.headers.get("Content-Type","").startswith("application/json") else {"raw": r.text})
+            "response": (resp_json if resp_json else {"raw": body_text})
         }, (200 if ok else 502)
 
     except requests.RequestException as e:
@@ -826,9 +954,10 @@ def execute_open_trade(
         )
         return {"status": "NETWORK_ERROR", "error": str(e)}, 502
 
-# =====================
+
+# ============================================================
 # Routes
-# =====================
+# ============================================================
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -849,6 +978,7 @@ def health():
         "force_risk_sizing": FORCE_RISK_SIZING,
         "db_path": DB_PATH,
         "alert_ttl_seconds": ALERT_TTL_SECONDS,
+        "max_alert_age_seconds": MAX_ALERT_AGE_SECONDS,
         "gpt_enabled": GPT_ENABLED,
         "gpt_model": GPT_MODEL,
         "gpt_min_confidence": GPT_MIN_CONFIDENCE,
@@ -869,6 +999,14 @@ def positions():
         return jsonify({"status": "OK", "response": r.json()})
     except requests.RequestException as e:
         return {"status": "NETWORK_ERROR", "error": repr(e)}, 502
+
+@app.route("/trade_state", methods=["GET"])
+def trade_state():
+    key = request.args.get("key", "")
+    if key != WEBHOOK_KEY:
+        return {"status": "UNAUTHORIZED"}, 401
+    pair = request.args.get("pair", "USD_JPY").upper().strip()
+    return jsonify({"status": "OK", "trade_state": get_trade_state(pair)})
 
 @app.route("/executions", methods=["GET"])
 def executions():
@@ -920,6 +1058,7 @@ def webhook():
 
     action = payload["action"]
 
+    # CLOSE ALL
     if action == "close_all":
         try:
             results = close_all_positions()
@@ -947,6 +1086,7 @@ def webhook():
 
     pair = payload["pair"]
 
+    # CLOSE (single)
     if action == "close":
         try:
             r = close_position(pair)
@@ -957,6 +1097,18 @@ def webhook():
                 current_net=None, projected_net=None, spread_pips=None,
                 oanda_http=r.status_code, status=("OK" if r.ok else "OANDA_ERROR"),
                 oanda_response=r.text, meta=None
+            )
+            # also clear trade_state best-effort
+            upsert_trade_state(
+                instrument=pair,
+                is_open=False,
+                side=None,
+                units=None,
+                entry_price=None,
+                entry_time_ms=None,
+                last_mark_price=None,
+                unrealized_pl_home=None,
+                realized_pl_home=None
             )
             return {"status": "OK" if r.ok else "OANDA_ERROR",
                     "http_status": r.status_code,
@@ -973,15 +1125,15 @@ def webhook():
             )
             return {"status": "NETWORK_ERROR"}, 502
 
-    # =====================
+    # ========================================================
     # OBSERVE -> GPT DECIDES
-    # =====================
+    # ========================================================
     if action == "observe":
         features = payload.get("features", {}) or {}
         hint_sl = payload.get("sl_pips", SL_PIPS_DEFAULT)
         hint_tp = payload.get("tp_pips", TP_PIPS_DEFAULT)
 
-        # NEW: Stale alert guard (uses TradingView bar time_ms)
+        # Stale alert guard using TradingView bar time_ms
         if MAX_ALERT_AGE_SECONDS > 0:
             try:
                 tv_time_ms = features.get("time_ms", None)
@@ -1000,7 +1152,6 @@ def webhook():
                         )
                         return {"status": "STALE_ALERT_IGNORED", "age_sec": age_sec, "max_age_sec": MAX_ALERT_AGE_SECONDS}, 200
             except Exception as e:
-                # If parsing fails, ignore the guard and continue
                 log(f"STALE_GUARD_PARSE_FAIL | alert_id={alert_id} | {repr(e)}")
 
         # Spread best effort
@@ -1012,37 +1163,48 @@ def webhook():
                 log(f"PRICE_FETCH_FAIL | alert_id={alert_id} | {pair} | {repr(e)}")
                 spread_pips_val = None
 
-        # Current net
+        # Current net + NAV
         try:
             current_net = get_net_units_for_instrument(pair)
+            nav, acct_ccy = get_account_nav_and_currency()
         except Exception as e:
-            log(f"POS_FETCH_FAIL | alert_id={alert_id} | {pair} | {repr(e)}")
+            log(f"STATE_FETCH_FAIL | alert_id={alert_id} | {repr(e)}")
             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
                 side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
                 current_net=None, projected_net=None, spread_pips=spread_pips_val,
-                status="RISK_BLOCKED_POS_FETCH_FAIL", oanda_http=None, oanda_response=repr(e),
+                status="STATE_FETCH_FAIL", oanda_http=None, oanda_response=repr(e),
                 meta=None
             )
-            return {"status": "RISK_BLOCKED_POS_FETCH_FAIL"}, 503
+            return {"status": "STATE_FETCH_FAIL", "error": str(e)}, 503
 
-        # NAV (for sizing)
-        try:
-            nav, acct_ccy = get_account_nav_and_currency()
-        except Exception as e:
-            log(f"ACCT_FETCH_FAIL | alert_id={alert_id} | {repr(e)}")
-            db_record_execution(
-                alert_id=alert_id, action="observe", instrument=pair,
-                side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
-                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                status="RISK_BLOCKED_ACCT_FETCH_FAIL", oanda_http=None, oanda_response=repr(e),
-                meta=None
-            )
-            return {"status": "RISK_BLOCKED_ACCT_FETCH_FAIL"}, 503
+        # Update mark + UPL in trade_state (if open)
+        ts = get_trade_state(pair)
+        if ts and int(ts.get("is_open", 0)) == 1 and ts.get("entry_price") and ts.get("side") and ts.get("units"):
+            try:
+                mark = get_mid_price(pair)
+                entry = Decimal(str(ts["entry_price"]))
+                side_ts = str(ts["side"])
+                units_ts = int(ts["units"])
+                upl = compute_unrealized_pl_home(pair, side_ts, units_ts, entry, mark, acct_ccy)
+                upsert_trade_state(
+                    instrument=pair,
+                    is_open=True,
+                    side=side_ts,
+                    units=units_ts,
+                    entry_price=entry,
+                    entry_time_ms=int(ts.get("entry_time_ms") or (time.time() * 1000)),
+                    last_mark_price=mark,
+                    unrealized_pl_home=upl,
+                    realized_pl_home=(Decimal(str(ts["realized_pl_home"])) if ts.get("realized_pl_home") else None)
+                )
+            except Exception:
+                pass
 
+        # GPT context includes the new lookback array automatically (inside features)
         gpt_ctx = {
             "pair": pair,
-            "features": features,
+            "features": features,  # includes lookback
             "hint": {"sl_pips": hint_sl, "tp_pips": hint_tp},
             "limits": {
                 "min_sl_pips": MIN_SL_PIPS,
@@ -1078,6 +1240,7 @@ def webhook():
             )
             return {"status": "GPT_HOLD_LOW_CONF", "decision": gpt_decision}, 200
 
+        # HOLD
         if gpt_decision["action"] == "HOLD":
             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
@@ -1088,25 +1251,59 @@ def webhook():
             )
             return {"status": "GPT_HOLD", "decision": gpt_decision}, 200
 
+        # CLOSE
         if gpt_decision["action"] == "CLOSE":
             try:
+                # try compute realized PnL using last mark if available
+                ts_before = get_trade_state(pair)
+                realized = None
+
                 r = close_position(pair)
+                ok = r.ok
+
+                # Attempt to compute realized from last mark and entry
+                try:
+                    if ts_before and int(ts_before.get("is_open", 0)) == 1:
+                        entry = Decimal(str(ts_before["entry_price"]))
+                        side_ts = str(ts_before["side"])
+                        units_ts = int(ts_before["units"])
+                        # use mid at close moment as approximation
+                        mark = get_mid_price(pair)
+                        realized = compute_unrealized_pl_home(pair, side_ts, units_ts, entry, mark, acct_ccy)
+                except Exception:
+                    realized = None
+
+                # Clear trade state and store realized
+                upsert_trade_state(
+                    instrument=pair,
+                    is_open=False,
+                    side=None,
+                    units=None,
+                    entry_price=None,
+                    entry_time_ms=None,
+                    last_mark_price=None,
+                    unrealized_pl_home=None,
+                    realized_pl_home=realized
+                )
+
                 db_record_execution(
                     alert_id=alert_id, action="close", instrument=pair,
                     side=None, units=None, sl_pips=None, tp_pips=None,
                     current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                    oanda_http=r.status_code, status=("OK" if r.ok else "OANDA_ERROR"),
+                    oanda_http=r.status_code, status=("OK" if ok else "OANDA_ERROR"),
                     oanda_response=r.text,
-                    meta=json.dumps(gpt_decision)
+                    meta=json.dumps({"gpt": gpt_decision, "realized_pl_home_est": (str(realized) if realized is not None else None)})
                 )
                 return {
-                    "status": "OK" if r.ok else "OANDA_ERROR",
+                    "status": "OK" if ok else "OANDA_ERROR",
                     "action": "close",
                     "http_status": r.status_code,
                     "instrument": pair,
                     "decision": gpt_decision,
+                    "realized_pl_home_est": (str(realized) if realized is not None else None),
                     "response": (r.json() if r.headers.get("Content-Type","").startswith("application/json") else {"raw": r.text})
-                }, (200 if r.ok else 502)
+                }, (200 if ok else 502)
+
             except Exception as e:
                 db_record_execution(
                     alert_id=alert_id, action="close", instrument=pair,
@@ -1117,8 +1314,7 @@ def webhook():
                 )
                 return {"status": "ERROR", "action": "close", "error": str(e), "decision": gpt_decision}, 502
 
-        # PATCH: One-position-at-a-time.
-        # If you already have a position, do NOT allow OPEN (prevents stacking/pyramiding).
+        # One-position-at-a-time: block OPEN if already in position
         if gpt_decision["action"] == "OPEN" and current_net != 0:
             log(f"GPT_HOLD_ALREADY_IN_POSITION | alert_id={alert_id} | {pair} | net={current_net} | {gpt_decision}")
             db_record_execution(
@@ -1173,17 +1369,13 @@ def webhook():
         )
         return {"status": "GPT_HOLD_UNKNOWN", "decision": gpt_decision}, 200
 
-    # =====================
-    # Manual OPEN (optional)
-    # PATCH: also enforce one-position-at-a-time for manual opens
-    # =====================
+    # Manual OPEN (optional) — kept from your version
     if action == "open":
         side = payload["side"]
         sl_pips = payload["sl_pips"]
         tp_pips = payload["tp_pips"]
         features = payload.get("features", {}) or {}
 
-        # Spread best-effort
         spread_pips_val = None
         if MAX_SPREAD_PIPS > 0:
             try:
@@ -1234,5 +1426,4 @@ def webhook():
 
 
 if __name__ == "__main__":
-    # Dev only. Production uses gunicorn.
     app.run(host="0.0.0.0", port=PORT, debug=False)

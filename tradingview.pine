@@ -2,45 +2,46 @@
 // © ashtpres
 
 //@version=6
-indicator("USD/JPY bot alerts (OBSERVE -> GPT decides) + time/volume/range", overlay=true)
+indicator("USD/JPY bot alerts (OBSERVE -> GPT decides) + lookback + key levels", overlay=true)
 
 // ====== INPUTS ======
-pair_input  = input.string("USD_JPY", "OANDA Pair (what your bot expects)", confirm=true)
-sl_pips     = input.int(25, "Default SL pips (hint only)", minval=1)
-tp_pips     = input.int(50, "Default TP pips (hint only)", minval=0)
+pair_input  = input.string("USD_JPY", "OANDA Pair", confirm=true)
+sl_pips     = input.int(25, "Default SL pips", minval=1)
+tp_pips     = input.int(50, "Default TP pips", minval=0)
+max_sl_pips = input.int(25, "MAX SL pips", minval=1)
+max_tp_pips = input.int(50, "MAX TP pips", minval=0)
+lookback_n  = input.int(7, "Lookback candles", minval=3, maxval=10)
 
-// Safety caps
-max_sl_pips = input.int(25, "MAX SL pips (bot cap)", minval=1)
-max_tp_pips = input.int(50, "MAX TP pips (bot cap)", minval=0)
-
-// Signal settings (these are features now, not direct trades)
-fastLen = input.int(12, "Fast EMA", minval=1)
-slowLen = input.int(36, "Slow EMA", minval=1)
-
-// Alert behavior
-fire_on_close = input.bool(true, "Fire observe on bar close only (recommended)")
-
-// Feature settings
-rsiLen = input.int(14, "RSI Len", minval=1)
-adxLen = input.int(14, "ADX Len", minval=1)
-atrLen = input.int(14, "ATR Len", minval=1)
+// Signal & Indicator Settings
+fastLen     = input.int(12, "Fast EMA")
+slowLen     = input.int(36, "Slow EMA")
+ema200Len   = input.int(200, "EMA 200 (Mean)")
+rsiLen      = input.int(14, "RSI Len")
+adxLen      = input.int(14, "ADX Len")
+atrLen      = input.int(14, "ATR Len")
+fire_on_close = input.bool(true, "Fire on bar close only")
 
 // ====== PIP SIZE ======
 pipSize = str.contains(pair_input, "JPY") ? 0.01 : 0.0001
 
-// ====== INDICATORS ======
-fast = ta.ema(close, fastLen)
-slow = ta.ema(close, slowLen)
+// ====== GLOBAL CALCULATIONS ======
+fast    = ta.ema(close, fastLen)
+slow    = ta.ema(close, slowLen)
+ema200  = ta.ema(close, ema200Len)
+rsi     = ta.rsi(close, rsiLen)
+[_, _, adx] = ta.dmi(adxLen, adxLen)
+atr     = ta.atr(atrLen)
 
 buyCross  = ta.crossover(fast, slow)
 sellCross = ta.crossunder(fast, slow)
-
 trendUp   = fast > slow
 trendDown = fast < slow
 
-rsi = ta.rsi(close, rsiLen)
-[_, _, adx] = ta.dmi(adxLen, adxLen)
-atr = ta.atr(atrLen)
+// 24H High/Low Logic
+sec_per_bar = timeframe.in_seconds(timeframe.period)
+bars_24h    = math.max(1, (sec_per_bar > 0) ? int(math.round(86400 / sec_per_bar)) : 288)
+high_24h    = ta.highest(high, bars_24h)
+low_24h     = ta.lowest(low, bars_24h)
 
 // Derived features
 atr_pips      = atr / pipSize
@@ -48,54 +49,80 @@ ema_sep_pips  = math.abs(fast - slow) / pipSize
 fast_slope_p  = (fast - fast[1]) / pipSize
 slow_slope_p  = (slow - slow[1]) / pipSize
 range_pips    = (high - low) / pipSize
-regime = adx >= 20 ? "trend" : "chop"
+regime        = adx >= 20 ? "trend" : "chop"
 
-// Bar time (ms since epoch). On confirmed bars, this is the bar close time.
-time_ms = time
+dist_to_high_24h = (high_24h - close) / pipSize
+dist_to_low_24h  = (close - low_24h) / pipSize
+dist_to_ema_200  = (close - ema200) / pipSize
 
-// ====== SAFETY ======
-can_trade = (sl_pips <= max_sl_pips) and (tp_pips <= max_tp_pips)
+rsi_change_3_bars        = rsi - rsi[3]
+price_change_3_bars_pips = (close - close[3]) / pipSize
 
-shouldFire = fire_on_close ? barstate.isconfirmed : true
-freq = fire_on_close ? alert.freq_once_per_bar_close : alert.freq_once_per_bar
+// ====== LOOKBACK JSON GENERATOR ======
+get_lookback_json(int n) =>
+    string s = "["
+    for i = 0 to n - 1
+        s += "{"
+        s += "\"i\":"          + str.tostring(i) + ","
+        s += "\"time_ms\":"    + str.tostring(time[i]) + ","
+        s += "\"open\":"       + str.tostring(open[i]) + ","
+        s += "\"high\":"       + str.tostring(high[i]) + ","
+        s += "\"low\":"        + str.tostring(low[i]) + ","
+        s += "\"close\":"      + str.tostring(close[i]) + ","
+        s += "\"rsi\":"        + str.tostring(rsi[i]) + ","
+        s += "\"adx\":"        + str.tostring(adx[i]) + ","
+        s += "\"range_pips\":" + str.tostring(range_pips[i]) + ","
+        s += "\"trendUp\":"    + str.tostring(trendUp[i]) + ","
+        s += "\"trendDown\":"  + str.tostring(trendDown[i])
+        s += "}"
+        if i < n - 1
+            s += ","
+    s += "]"
+    s
 
-// ====== ID BASE ======
-id_base = pair_input + ":" + str.tostring(time_ms) + ":" + str.tostring(bar_index)
+// ====== MAIN ALERT JSON ======
+if (sl_pips <= max_sl_pips) and (tp_pips <= max_tp_pips) and (fire_on_close ? barstate.isconfirmed : true)
+    id_base = pair_input + ":" + str.tostring(time) + ":" + str.tostring(bar_index)
+    
+    // Parentheses added here to allow multi-line string concatenation
+    json_payload = (
+         "{\"alert_id\":\"" + id_base + ":obs\",\"action\":\"observe\",\"pair\":\"" + pair_input + "\"," +
+         "\"sl_pips\":" + str.tostring(sl_pips) + ",\"tp_pips\":" + str.tostring(tp_pips) + "," +
+         "\"features\":{" +
+            "\"tf\":\"" + timeframe.period + "\"," +
+            "\"time_ms\":" + str.tostring(time) + "," +
+            "\"volume\":" + str.tostring(volume) + "," +
+            "\"range_pips\":" + str.tostring(range_pips) + "," +
+            "\"open\":" + str.tostring(open) + "," +
+            "\"high\":" + str.tostring(high) + "," +
+            "\"low\":" + str.tostring(low) + "," +
+            "\"close\":" + str.tostring(close) + "," +
+            "\"rsi\":" + str.tostring(rsi) + "," +
+            "\"adx\":" + str.tostring(adx) + "," +
+            "\"atr_pips\":" + str.tostring(atr_pips) + "," +
+            "\"ema_sep_pips\":" + str.tostring(ema_sep_pips) + "," +
+            "\"fast_slope_pips\":" + str.tostring(fast_slope_p) + "," +
+            "\"slow_slope_pips\":" + str.tostring(slow_slope_p) + "," +
+            "\"dist_to_high_24h\":" + str.tostring(dist_to_high_24h) + "," +
+            "\"dist_to_low_24h\":" + str.tostring(dist_to_low_24h) + "," +
+            "\"dist_to_ema_200\":" + str.tostring(dist_to_ema_200) + "," +
+            "\"rsi_change_3_bars\":" + str.tostring(rsi_change_3_bars) + "," +
+            "\"price_change_3_bars_pips\":" + str.tostring(price_change_3_bars_pips) + "," +
+            "\"buyCross\":" + str.tostring(buyCross) + "," +
+            "\"sellCross\":" + str.tostring(sellCross) + "," +
+            "\"trendUp\":" + str.tostring(trendUp) + "," +
+            "\"trendDown\":" + str.tostring(trendDown) + "," +
+            "\"regime\":\"" + regime + "\"," +
+            "\"lookback\":" + get_lookback_json(lookback_n) +
+         "}" +
+         "}"
+         )
 
-// ====== JSON BUILDERS ======
-observe_json() =>
-    "{\"alert_id\":\"" + id_base + ":obs\",\"action\":\"observe\",\"pair\":\"" + pair_input + "\"," +
-     "\"sl_pips\":" + str.tostring(sl_pips) + ",\"tp_pips\":" + str.tostring(tp_pips) + "," +
-     "\"features\":{" +
-     "\"tf\":\"" + timeframe.period + "\"," +
-     "\"time_ms\":" + str.tostring(time_ms) + "," +
-     "\"volume\":" + str.tostring(volume) + "," +
-     "\"range_pips\":" + str.tostring(range_pips) + "," +
-     "\"open\":" + str.tostring(open) + "," +
-     "\"high\":" + str.tostring(high) + "," +
-     "\"low\":" + str.tostring(low) + "," +
-     "\"close\":" + str.tostring(close) + "," +
-     "\"rsi\":" + str.tostring(rsi) + "," +
-     "\"adx\":" + str.tostring(adx) + "," +
-     "\"atr_pips\":" + str.tostring(atr_pips) + "," +
-     "\"ema_sep_pips\":" + str.tostring(ema_sep_pips) + "," +
-     "\"fast_slope_pips\":" + str.tostring(fast_slope_p) + "," +
-     "\"slow_slope_pips\":" + str.tostring(slow_slope_p) + "," +
-     "\"buyCross\":" + str.tostring(buyCross) + "," +
-     "\"sellCross\":" + str.tostring(sellCross) + "," +
-     "\"trendUp\":" + str.tostring(trendUp) + "," +
-     "\"trendDown\":" + str.tostring(trendDown) + "," +
-     "\"fastLen\":" + str.tostring(fastLen) + "," +
-     "\"slowLen\":" + str.tostring(slowLen) + "," +
-     "\"regime\":\"" + regime + "\"" +
-     "}" +
-     "}"
-
-if can_trade and shouldFire
-    alert(observe_json(), freq)
+    alert(json_payload, fire_on_close ? alert.freq_once_per_bar_close : alert.freq_once_per_bar)
 
 // ====== VISUALS ======
-plot(fast, title="Fast EMA")
-plot(slow, title="Slow EMA")
-plotshape(buyCross and shouldFire,  title="BuyCross",  style=shape.triangleup,   location=location.belowbar, text="XUP")
-plotshape(sellCross and shouldFire, title="SellCross", style=shape.triangledown, location=location.abovebar, text="XDN")
+plot(fast, color=color.blue, title="Fast EMA")
+plot(slow, color=color.orange, title="Slow EMA")
+plot(ema200, color=color.gray, title="EMA 200", linewidth=2)
+plotshape(buyCross,  title="BuyCross",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small)
+plotshape(sellCross, title="SellCross", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
