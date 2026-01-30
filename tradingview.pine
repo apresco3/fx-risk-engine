@@ -1,0 +1,56 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ashtpres
+
+//@version=6
+indicator("EUR/USD bot alerts", overlay=true)
+
+// ====== INPUTS ======
+pair_input  = input.string("EUR_USD", "OANDA Pair (what your bot expects)", confirm=true)
+sl_pips     = input.int(20, "SL pips", minval=1)
+tp_pips     = input.int(40, "TP pips", minval=0)
+
+// Safety caps (keep in sync with bot .env MAX_SL_PIPS / MAX_TP_PIPS)
+max_sl_pips = input.int(20, "MAX SL pips (bot cap)", minval=1)
+max_tp_pips = input.int(40, "MAX TP pips (bot cap)", minval=0)
+
+// Simple starter signals: MA cross
+fastLen = input.int(10, "Fast MA", minval=1)
+slowLen = input.int(30, "Slow MA", minval=1)
+
+fast = ta.ema(close, fastLen)
+slow = ta.ema(close, slowLen)
+
+buySignal  = ta.crossover(fast, slow)
+sellSignal = ta.crossunder(fast, slow)
+
+can_trade = (sl_pips <= max_sl_pips) and (tp_pips <= max_tp_pips)
+
+// ====== ID BASE ======
+id_base = pair_input + ":" + str.tostring(time)
+
+// ====== JSON BUILDERS (single-line, no continuation issues) ======
+open_json(side) =>
+    "{\"alert_id\":\"" + id_base + ":open\",\"action\":\"open\",\"side\":\"" + side + "\",\"pair\":\"" + pair_input + "\",\"sl_pips\":" + str.tostring(sl_pips) + ",\"tp_pips\":" + str.tostring(tp_pips) + "}"
+
+close_json() =>
+    "{\"alert_id\":\"" + id_base + ":close\",\"action\":\"close\",\"pair\":\"" + pair_input + "\"}"
+
+reverse_json(side) =>
+    "{\"alert_id\":\"" + id_base + ":reverse\",\"action\":\"reverse\",\"side\":\"" + side + "\",\"pair\":\"" + pair_input + "\",\"sl_pips\":" + str.tostring(sl_pips) + ",\"tp_pips\":" + str.tostring(tp_pips) + "}"
+
+// ====== FIRE ALERTS ======
+if buySignal and can_trade
+    alert(open_json("buy"), alert.freq_once_per_bar)
+
+if sellSignal and can_trade
+    alert(open_json("sell"), alert.freq_once_per_bar)
+
+// (Leave close/reverse disabled until you want them)
+// if buySignal or sellSignal
+//     alert(close_json(), alert.freq_once_per_bar)
+
+// ====== VISUALS ======
+plot(fast, title="Fast MA")
+plot(slow, title="Slow MA")
+plotshape(buySignal,  title="Buy",  style=shape.triangleup,   location=location.belowbar, text="BUY")
+plotshape(sellSignal, title="Sell", style=shape.triangledown, location=location.abovebar, text="SELL")
