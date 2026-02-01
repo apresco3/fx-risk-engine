@@ -28,12 +28,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GPT_ENABLED = os.getenv("GPT_ENABLED", "false").lower() == "true"
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-5.2")
 GPT_MIN_CONFIDENCE = float(os.getenv("GPT_MIN_CONFIDENCE", "0.55"))
-GPT_FAIL_OPEN = os.getenv("GPT_FAIL_OPEN", "false").lower() == "true"
 
 # Safety: default disallows scaling up (1.0 => only reduce or unchanged)
 GPT_MAX_UNITS_MULT = float(os.getenv("GPT_MAX_UNITS_MULT", "1.0"))
-
-# Optional: OpenAI client timeout (seconds)
 GPT_TIMEOUT_SECONDS = float(os.getenv("GPT_TIMEOUT_SECONDS", "12"))
 
 openai_client = None
@@ -43,7 +40,7 @@ if OpenAI and OPENAI_API_KEY:
     except Exception:
         openai_client = None
 
-# Function tool schema (strict mode = schema-locked)
+# Function tool schema
 DECIDE_TRADE_TOOL = [
     {
         "type": "function",
@@ -92,18 +89,6 @@ def log(msg: str):
         f.write(f"{datetime.datetime.now().isoformat()} | {msg}\n")
 
 def gpt_decide_trade(context: dict) -> dict:
-    """
-    Returns dict:
-      {
-        "action": "HOLD|OPEN|CLOSE",
-        "side": "buy|sell|null",
-        "sl_pips": int|null,
-        "tp_pips": int|null,
-        "units_mult": float,
-        "confidence": float,
-        "reason": str
-      }
-    """
     safe_hold = {
         "action": "HOLD",
         "side": None,
@@ -120,57 +105,33 @@ def gpt_decide_trade(context: dict) -> dict:
         return safe_hold
 
     if not openai_client:
-        if GPT_FAIL_OPEN:
-            safe_hold["reason"] = "GPT_NO_CLIENT_FAIL_OPEN_BUT_HOLD"
-            return safe_hold
+        safe_hold["reason"] = "GPT_NO_CLIENT"
         return safe_hold
 
     instructions = (
             "You are an FX execution gatekeeper. Output ONLY the decide_trade tool call.\n\n"
-
             "Context:\n"
-            "- You receive a current snapshot and a lookback sequence in features.lookback (array of recent candles).\n"
-            "- Distances to key levels and summary stats are provided; do NOT compute math.\n\n"
-
+            "- You receive a current snapshot and a lookback sequence.\n"
+            "- Pre-computed flags (is_overextended, trend_bias) are provided in 'analysis'. Use them.\n\n"
             "Interpretation of inputs:\n"
             "- state.current_net: 0=flat; >0 long; <0 short.\n"
             "- state.spread_pips: Current spread (check against limits.max_spread_pips).\n"
             "- features.adx: Trend strength (higher = stronger trend).\n"
             "- features.ema_sep_pips: Fast/Slow EMA gap (small gap = chop).\n"
-            "- features.lookback: Sequence of last N candles for momentum inference.\n\n"
-
-            "Key Levels & Overextension Filters:\n"
-            "- features.dist_to_high_24h: Pips below 24h high. (BUY blocked if < 5 unless ADX >= 28).\n"
-            "- features.dist_to_low_24h: Pips above 24h low. (SELL blocked if < 5 unless ADX >= 28).\n"
-            "- features.dist_to_ema_200 (dMean): Signed pips from mean.\n"
-            "    * If abs(dMean) > 40 AND adx < 20: HOLD (Overextended).\n"
-            "    * If abs(dMean) > 60 AND adx < 28: HOLD (Severely Overextended).\n\n"
-
-            "Momentum Confirmation (Summary Stats):\n"
-            "- BUY Confirmation: rsi_change_3_bars > 0 AND price_change_3_bars_pips > 0.\n"
-            "- SELL Confirmation: rsi_change_3_bars < 0 AND price_change_3_bars_pips < 0.\n"
-            "- Lookback Inference: Predominant direction of last 5 candles must match trade side.\n\n"
-
+            "- analysis.is_overextended: TRUE if price is too far from mean (Do not buy High/Sell Low).\n"
+            "- analysis.trend_bias: 'bullish', 'bearish', or 'mixed' (based on last 5 candles).\n\n"
             "Hard Constraints:\n"
-            "- Action=HOLD if spread > max_spread_pips or spread is null.\n"
-            "- Total Net Position Constraint: You MAY add to a position (pyramid) ONLY IF abs(state.current_net + units_calculated) <= limits.max_net_units.\n"
-            "- Scaling Rule: If state.current_net > 0 (Long), ONLY OPEN 'buy'. If < 0 (Short), ONLY OPEN 'sell'. Do NOT hedge.\n"
+            "- Action=HOLD if spread > max_spread_pips.\n"
+            "- DIRECTIONAL ENFORCEMENT: If state.current_net > 0 (Long), you MUST NOT OPEN 'sell' (Use CLOSE to exit). If < 0, MUST NOT OPEN 'buy'.\n"
             "- sl_pips must be in [limits.min_sl_pips, limits.max_sl_pips].\n"
-            "- tp_pips must be in [10, limits.max_tp_pips]. (Safety: Minimum 10 pips).\n\n"
-
+            "- tp_pips: Use 0 for No TP. Use null to accept default/hint. If > 0, must be >= 10.\n\n"
             "Execution Logic:\n"
             "1. Setup A (Cross): Cross detected + Momentum Confirmation + ADX/SEP filters met.\n"
             "2. Setup B (Continuation): ADX >= 22 + Trend/Slope match + Lookback consistency.\n"
-            "3. Sizing: units_mult = 1.0. Reduce to 0.5 if ADX [15-17], low separation, or weak momentum confirmation.\n\n"
-
+            "3. Sizing: units_mult = 1.0. Reduce to 0.5 if ADX [15-17], low separation, or weak momentum.\n\n"
             "CLOSE rules (allowed to close):\n"
-            "- If state.current_net > 0 (long):\n"
-            "    * CLOSE if features.trendDown is true (trend flipped) OR features.sellCross is true OR features.adx < 14.\n"
-            "    * Else HOLD.\n"
-            "- If state.current_net < 0 (short):\n"
-            "    * CLOSE if features.trendUp is true (trend flipped) OR features.buyCross is true OR features.adx < 14.\n"
-            "    * Else HOLD.\n\n"
-
+            "- If Long: CLOSE if trendDown is true OR sellCross is true OR adx < 14.\n"
+            "- If Short: CLOSE if trendUp is true OR buyCross is true OR adx < 14.\n\n"
             "Confidence:\n"
             "- Perfect alignment: >= 0.75.\n"
             "- Trend continuation: >= 0.70.\n"
@@ -180,6 +141,8 @@ def gpt_decide_trade(context: dict) -> dict:
     try:
         resp = openai_client.responses.create(
             model=GPT_MODEL,
+            reasoning={"effort": "low"},   # speed + consistency
+            max_output_tokens=200,         # tool call only
             instructions=instructions,
             tools=DECIDE_TRADE_TOOL,
             tool_choice={"type": "function", "name": "decide_trade"},
@@ -215,6 +178,13 @@ def gpt_decide_trade(context: dict) -> dict:
 
                 reason = str(out.get("reason", "")).strip()[:1200]
 
+                # --- Normalization (Keep DB Clean) ---
+                if action != "OPEN":
+                    side = None
+                    sl_pips = None
+                    tp_pips = None
+                    units_mult = 1.0
+
                 return {
                     "action": action,
                     "side": side,
@@ -244,13 +214,10 @@ TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 
 MAX_UNITS = int(os.getenv("MAX_UNITS", "1000"))
 MAX_NET_UNITS = int(os.getenv("MAX_NET_UNITS", "2000"))
-
-# Stale alert guard (0 disables)
 MAX_ALERT_AGE_SECONDS = int(os.getenv("MAX_ALERT_AGE_SECONDS", "0"))
 
 SL_PIPS_DEFAULT = int(os.getenv("SL_PIPS", "20"))
 TP_PIPS_DEFAULT = int(os.getenv("TP_PIPS", "40"))
-
 MAX_SL_PIPS = int(os.getenv("MAX_SL_PIPS", str(SL_PIPS_DEFAULT)))
 MAX_TP_PIPS = int(os.getenv("MAX_TP_PIPS", str(TP_PIPS_DEFAULT)))
 MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "1"))
@@ -261,8 +228,7 @@ RISK_PCT = Decimal(os.getenv("RISK_PCT", "0.0025"))
 MAX_RISK_USD = Decimal(os.getenv("MAX_RISK_USD", "100"))
 DAILY_LOSS_LIMIT_USD = Decimal(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))
 
-FORCE_RISK_SIZING = os.getenv("FORCE_RISK_SIZING", "true").lower() == "true"
-ALLOW_NONQUOTE_HOME_SIZING = os.getenv("ALLOW_NONQUOTE_HOME_SIZING", "false").lower() == "true"
+ALLOW_NONQUOTE_HOME_SIZING = os.getenv("ALLOW_NONQUOTE_HOME_SIZING", "true").lower() == "true"
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "60"))
@@ -293,14 +259,12 @@ def db_conn():
 def db_init():
     conn = db_conn()
     cur = conn.cursor()
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
             alert_id TEXT PRIMARY KEY,
             first_seen_ts INTEGER NOT NULL
         );
     """)
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS executions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -321,8 +285,6 @@ def db_init():
             meta TEXT
         );
     """)
-
-    # New: current position snapshot
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_state (
             instrument TEXT PRIMARY KEY,
@@ -337,20 +299,16 @@ def db_init():
             last_update_ts INTEGER
         );
     """)
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_state (
             day TEXT PRIMARY KEY,
             nav_start TEXT NOT NULL
         );
     """)
-
-    # migrations for older DBs
     cur.execute("PRAGMA table_info(executions);")
     cols = {row["name"] for row in cur.fetchall()}
     if "meta" not in cols:
         cur.execute("ALTER TABLE executions ADD COLUMN meta TEXT;")
-
     conn.commit()
     conn.close()
 
@@ -447,10 +405,8 @@ def upsert_trade_state(
 def seen_before(alert_id: str) -> bool:
     now = int(time.time())
     cutoff = now - ALERT_TTL_SECONDS
-
     conn = db_conn()
     cur = conn.cursor()
-
     cur.execute("DELETE FROM alerts WHERE first_seen_ts < ?", (cutoff,))
     cur.execute("SELECT first_seen_ts FROM alerts WHERE alert_id = ?", (alert_id,))
     row = cur.fetchone()
@@ -458,7 +414,6 @@ def seen_before(alert_id: str) -> bool:
         conn.commit()
         conn.close()
         return True
-
     cur.execute("INSERT INTO alerts (alert_id, first_seen_ts) VALUES (?, ?)", (alert_id, now))
     conn.commit()
     conn.close()
@@ -506,7 +461,6 @@ def get_spread_pips(instrument: str) -> float:
     prices = data.get("prices", [])
     if not prices:
         raise RuntimeError("No pricing data returned")
-
     p = prices[0]
     bid = Decimal(p["bids"][0]["price"])
     ask = Decimal(p["asks"][0]["price"])
@@ -522,7 +476,6 @@ def get_mid_price(instrument: str) -> Decimal:
     prices = data.get("prices", [])
     if not prices:
         raise RuntimeError("No pricing data returned")
-
     p = prices[0]
     bid = Decimal(p["bids"][0]["price"])
     ask = Decimal(p["asks"][0]["price"])
@@ -532,7 +485,6 @@ def get_net_units_for_instrument(instrument: str) -> int:
     r = oanda_get_open_positions()
     if not r.ok:
         raise RuntimeError(f"Failed to fetch open positions: HTTP {r.status_code} {r.text}")
-
     data = r.json()
     for pos in data.get("positions", []):
         if pos.get("instrument") == instrument:
@@ -559,7 +511,6 @@ def close_position(instrument: str):
     r = oanda_get_open_positions()
     if not r.ok:
         raise RuntimeError(f"Failed to fetch open positions: HTTP {r.status_code} {r.text}")
-
     long_units = 0
     short_units = 0
     for pos in r.json().get("positions", []):
@@ -567,13 +518,11 @@ def close_position(instrument: str):
             long_units = int(pos.get("long", {}).get("units", "0"))
             short_units = int(pos.get("short", {}).get("units", "0"))
             break
-
     payload = {}
     if long_units > 0:
         payload["longUnits"] = "ALL"
     if short_units < 0:
         payload["shortUnits"] = "ALL"
-
     if not payload:
         class Dummy:
             ok = True
@@ -582,7 +531,6 @@ def close_position(instrument: str):
             headers = {"Content-Type": "application/json"}
             def json(self): return {"skipped": True, "reason": "already_flat"}
         return Dummy()
-
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/positions/{instrument}/close"
     return requests.put(url, json=payload, headers=HEADERS, timeout=10)
 
@@ -590,7 +538,6 @@ def close_all_positions():
     r = oanda_get_open_positions()
     if not r.ok:
         raise RuntimeError(f"Failed to fetch open positions: HTTP {r.status_code} {r.text}")
-
     instruments = [p.get("instrument") for p in r.json().get("positions", []) if p.get("instrument")]
     results = []
     for inst in instruments:
@@ -611,7 +558,6 @@ def sl_tp_distance(instrument: str, sl_pips: int, tp_pips: int):
 
 def place_market_order(*, instrument: str, signed_units: int, sl_pips: int, tp_pips: int):
     sl_dist, tp_dist = sl_tp_distance(instrument, sl_pips, tp_pips)
-
     order = {
         "order": {
             "instrument": instrument,
@@ -625,7 +571,6 @@ def place_market_order(*, instrument: str, signed_units: int, sl_pips: int, tp_p
         order["order"]["stopLossOnFill"] = {"distance": fmt_price_decimal(sl_dist, instrument)}
     if tp_dist is not None:
         order["order"]["takeProfitOnFill"] = {"distance": fmt_price_decimal(tp_dist, instrument)}
-
     return requests.post(
         f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders",
         json=order,
@@ -639,13 +584,10 @@ def place_market_order(*, instrument: str, signed_units: int, sl_pips: int, tp_p
 def quote_to_home_mid(quote_ccy: str, home_ccy: str) -> Optional[Decimal]:
     if quote_ccy == home_ccy:
         return Decimal(1)
-
     if not ALLOW_NONQUOTE_HOME_SIZING:
         return None
-
     quote_home = f"{quote_ccy}_{home_ccy}"
     home_quote = f"{home_ccy}_{quote_ccy}"
-
     try:
         r = oanda_get_pricing(quote_home)
         if r.ok and r.json().get("prices"):
@@ -655,7 +597,6 @@ def quote_to_home_mid(quote_ccy: str, home_ccy: str) -> Optional[Decimal]:
             return (bid + ask) / Decimal(2)
     except Exception:
         pass
-
     r2 = oanda_get_pricing(home_quote)
     if not r2.ok or not r2.json().get("prices"):
         return None
@@ -665,25 +606,15 @@ def quote_to_home_mid(quote_ccy: str, home_ccy: str) -> Optional[Decimal]:
     mid2 = (bid2 + ask2) / Decimal(2)   # 1 home = mid2 quote
     return Decimal(1) / mid2            # 1 quote = 1/mid2 home
 
-def compute_unrealized_pl_home(
-    instrument: str,
-    side: str,
-    units: int,
-    entry_price: Decimal,
-    mark_price: Decimal,
-    account_ccy: str
-) -> Optional[Decimal]:
-    # P/L in quote currency then convert
+def compute_unrealized_pl_home(instrument: str, side: str, units: int, entry_price: Decimal, mark_price: Decimal, account_ccy: str) -> Optional[Decimal]:
     _, quote = instrument.split("_")
     u = abs(int(units))
     if u == 0:
         return Decimal(0)
-
     if side == "buy":
         pl_quote = (mark_price - entry_price) * Decimal(u)
     else:
         pl_quote = (entry_price - mark_price) * Decimal(u)
-
     conv = quote_to_home_mid(quote, account_ccy)
     if conv is None:
         return None
@@ -696,18 +627,16 @@ def loss_per_unit_home(*, instrument: str, sl_pips: int, account_ccy: str) -> De
     _, quote = instrument.split("_")
     pip = pip_size_for(instrument)
     sl_dist_quote = pip * Decimal(sl_pips)
-
     if sl_pips <= 0:
         raise RuntimeError("sl_pips must be > 0 for risk sizing")
-
     if quote == account_ccy:
         return sl_dist_quote
-
     conv = quote_to_home_mid(quote, account_ccy)
     if conv is None:
+        # We will catch this upstream now
         raise RuntimeError(
             f"Cannot risk-size safely: quote={quote} != account_ccy={account_ccy}. "
-            f"Set ALLOW_NONQUOTE_HOME_SIZING=true to allow approximate conversion."
+            f"Market conversion failed."
         )
     return sl_dist_quote * conv
 
@@ -721,38 +650,20 @@ def compute_units_from_risk(*, instrument: str, sl_pips: int, nav: Decimal, acco
 # Validation
 # ============================================================
 def validate_payload(data: dict):
-    """
-    OBSERVE (TradingView):
-      {"alert_id":"...", "action":"observe", "pair":"USD_JPY", "sl_pips":25, "tp_pips":50, "features":{...}}
-
-    Manual OPEN (optional):
-      {"alert_id":"...", "action":"open", "side":"buy|sell", "pair":"USD_JPY", "sl_pips":25, "tp_pips":50}
-
-    CLOSE (single):
-      {"alert_id":"...", "action":"close", "pair":"USD_JPY"}
-
-    CLOSE_ALL:
-      {"alert_id":"...", "action":"close_all"}
-    """
     alert_id = str(data.get("alert_id", "")).strip()
     action = str(data.get("action", "observe")).lower().strip()
     pair = str(data.get("pair", "")).upper().strip()
-
     if not alert_id:
         return None, "Missing alert_id"
     if action not in {"observe", "open", "close", "close_all"}:
-        return None, "Invalid action (observe|open|close|close_all)"
-
+        return None, "Invalid action"
     if action == "close_all":
         return {"alert_id": alert_id, "action": action}, None
-
     if action in {"observe", "close", "open"}:
         if "_" not in pair:
-            return None, "Invalid pair format (use USD_JPY)"
-
+            return None, "Invalid pair format"
     if action == "close":
         return {"alert_id": alert_id, "action": action, "pair": pair}, None
-
     sl_pips = data.get("sl_pips", SL_PIPS_DEFAULT)
     tp_pips = data.get("tp_pips", TP_PIPS_DEFAULT)
     try:
@@ -760,14 +671,11 @@ def validate_payload(data: dict):
         tp_pips = int(tp_pips)
     except Exception:
         return None, "sl_pips/tp_pips must be integers"
-
     sl_pips = max(MIN_SL_PIPS, min(sl_pips if sl_pips > 0 else SL_PIPS_DEFAULT, MAX_SL_PIPS))
     tp_pips = max(0, min(tp_pips if tp_pips >= 0 else TP_PIPS_DEFAULT, MAX_TP_PIPS))
-
     features = data.get("features", {}) or {}
     if not isinstance(features, dict):
         return None, "features must be an object"
-
     if action == "observe":
         return {
             "alert_id": alert_id,
@@ -777,12 +685,9 @@ def validate_payload(data: dict):
             "tp_pips": tp_pips,
             "features": features
         }, None
-
-    # open requires side
     side = str(data.get("side", "")).lower().strip()
     if side not in {"buy", "sell"}:
-        return None, "Invalid side (buy|sell)"
-
+        return None, "Invalid side"
     return {
         "alert_id": alert_id,
         "action": "open",
@@ -793,17 +698,11 @@ def validate_payload(data: dict):
         "features": features
     }, None
 
-# ============================================================
-# Pyramiding Cool-Down Helper
-# ============================================================
 def check_cooldown(instrument: str, cooldown_minutes: int) -> bool:
-    """Returns True if we are allowed to trade (cooldown expired), False otherwise."""
     if cooldown_minutes <= 0:
         return True
-        
     conn = db_conn()
     cur = conn.cursor()
-    # Find the last successful OPEN for this instrument
     cur.execute("""
         SELECT ts FROM executions 
         WHERE instrument = ? AND action = 'open' AND status = 'OK'
@@ -811,15 +710,27 @@ def check_cooldown(instrument: str, cooldown_minutes: int) -> bool:
     """, (instrument,))
     row = cur.fetchone()
     conn.close()
-    
     if not row:
-        return True # No previous trades, safe to trade
-        
+        return True
     last_ts = row["ts"]
     now = int(time.time())
     elapsed_minutes = (now - last_ts) / 60.0
-    
     return elapsed_minutes >= cooldown_minutes
+
+def _f(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _b(x) -> bool:
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return x != 0
+    if isinstance(x, str):
+        return x.strip().lower() in ("true", "1", "yes", "y", "t")
+    return False
 
 # ============================================================
 # Core execution helper
@@ -839,12 +750,32 @@ def execute_open_trade(
     meta: dict
 ) -> Tuple[Dict[str, Any], int]:
 
-    # 1. Spread Gate (Avoid trading during news spikes/rollover)
+    # --- SAFETY BLOCK: NO HEDGE/FLIP ENFORCEMENT ---
+    if current_net > 0 and side == "sell":
+        db_record_execution(
+            alert_id=alert_id, action="open", instrument=pair, side=side,
+            units=None, sl_pips=None, tp_pips=None,
+            current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+            status="SAFETY_BLOCKED_FLIP", oanda_http=None, oanda_response=None,
+            meta=json.dumps(meta)
+        )
+        return {"status": "SAFETY_BLOCKED_FLIP", "reason": "Cannot OPEN SELL while Long. Use CLOSE first."}, 200
+
+    if current_net < 0 and side == "buy":
+        db_record_execution(
+            alert_id=alert_id, action="open", instrument=pair, side=side,
+            units=None, sl_pips=None, tp_pips=None,
+            current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+            status="SAFETY_BLOCKED_FLIP", oanda_http=None, oanda_response=None,
+            meta=json.dumps(meta)
+        )
+        return {"status": "SAFETY_BLOCKED_FLIP", "reason": "Cannot OPEN BUY while Short. Use CLOSE first."}, 200
+
+    # 1. Spread Gate
     if MAX_SPREAD_PIPS > 0:
-        # Define dynamic max spread based on asset class
         current_max_spread = MAX_SPREAD_PIPS
         if "XAU" in pair:
-            current_max_spread = 60.0  # Allow up to 60 pips ($0.60) for Gold
+            current_max_spread = 60.0
         
         if spread_pips_val is None:
             db_record_execution(
@@ -866,7 +797,7 @@ def execute_open_trade(
             )
             return {"status": "RISK_BLOCKED_SPREAD", "spread_pips": spread_pips_val, "cap": current_max_spread}, 403
 
-    # 2. Daily Loss Limit (Circuit Breaker)
+    # 2. Daily Loss Limit
     if DAILY_LOSS_LIMIT_USD > 0:
         day_start_nav = get_day_start_nav(nav)
         if day_start_nav - nav >= DAILY_LOSS_LIMIT_USD:
@@ -877,43 +808,59 @@ def execute_open_trade(
                 status="RISK_BLOCKED_DAILY_LOSS_LIMIT", oanda_http=None, oanda_response=None,
                 meta=json.dumps(meta)
             )
-            return {
-                "status": "RISK_BLOCKED_DAILY_LOSS_LIMIT",
-                "nav_start": str(day_start_nav),
-                "nav_now": str(nav),
-                "limit": str(DAILY_LOSS_LIMIT_USD)
-            }, 403
+            return {"status": "RISK_BLOCKED_DAILY_LOSS_LIMIT"}, 403
 
     # 3. Position Sizing Logic (Risk % + GPT Scale + Min/Max Constraints)
-    # A. Base risk calculation (e.g. 0.25% of Equity)
-    units = compute_units_from_risk(instrument=pair, sl_pips=sl_pips, nav=nav, account_ccy=acct_ccy)
+    try:
+        units = compute_units_from_risk(instrument=pair, sl_pips=sl_pips, nav=nav, account_ccy=acct_ccy)
+    except Exception as e:
+        log(f"RISK SIZING ERROR | {pair} | {e}")
+        db_record_execution(
+            alert_id=alert_id, action="open", instrument=pair, side=side,
+            units=None, sl_pips=sl_pips, tp_pips=tp_pips,
+            current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+            status="RISK_CALC_ERROR", oanda_http=None, oanda_response=str(e),
+            meta=json.dumps(meta)
+        )
+        return {"status": "RISK_CALC_ERROR", "error": str(e)}, 403
 
-    # B. Apply GPT Probability Multiplier (e.g. 0.5x if confidence is lower)
     units_mult = max(0.1, min(float(units_mult), GPT_MAX_UNITS_MULT))
     units = int(units * units_mult)
     
-    # C. Enforce Hard Floor (Minimum $10 or 10 units) & Ceiling (Max Units)
     min_units = int(os.getenv("MIN_TRADE_UNITS", "10"))
     units = max(min_units, units) 
     units = min(units, MAX_UNITS)
 
-    # 4. Absolute Max Risk Gate (Double check money at risk vs max dollar limit)
-    loss_unit = loss_per_unit_home(instrument=pair, sl_pips=sl_pips, account_ccy=acct_ccy)
-    expected_loss = loss_unit * Decimal(units)
-    max_loss = min(nav, MAX_RISK_USD)
-    
-    if expected_loss > max_loss:
-        # If min_units forces risk above MAX_RISK_USD, block the trade
+    # --- P1 FIX: Enforce TP Floor (minimum 10 pips) in execution logic ---
+    if tp_pips is not None and tp_pips > 0:
+        tp_pips = int(max(10, min(tp_pips, MAX_TP_PIPS)))
+
+    # 4. Absolute Max Risk Gate
+    try:
+        loss_unit = loss_per_unit_home(instrument=pair, sl_pips=sl_pips, account_ccy=acct_ccy)
+        expected_loss = loss_unit * Decimal(units)
+        max_loss = min(nav, MAX_RISK_USD)
+        
+        if expected_loss > max_loss:
+            db_record_execution(
+                alert_id=alert_id, action="open", instrument=pair, side=side,
+                units=units, sl_pips=sl_pips, tp_pips=tp_pips,
+                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+                status="RISK_BLOCKED_MAX_RISK_USD", oanda_http=None, oanda_response=None,
+                meta=json.dumps(meta)
+            )
+            return {"status": "RISK_BLOCKED_MAX_RISK_USD", "expected_loss": str(expected_loss), "cap": str(max_loss)}, 403
+    except Exception as e:
         db_record_execution(
             alert_id=alert_id, action="open", instrument=pair, side=side,
             units=units, sl_pips=sl_pips, tp_pips=tp_pips,
             current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-            status="RISK_BLOCKED_MAX_RISK_USD", oanda_http=None, oanda_response=None,
+            status="RISK_CALC_ERROR", oanda_http=None, oanda_response=str(e),
             meta=json.dumps(meta)
         )
-        return {"status": "RISK_BLOCKED_MAX_RISK_USD", "expected_loss": str(expected_loss), "cap": str(max_loss)}, 403
+        return {"status": "RISK_CALC_ERROR", "error": str(e)}, 403
 
-    # 5. Net Exposure Gate (Pyramiding Safety)
+    # 5. Net Exposure Gate
     signed_units = -units if side == "sell" else units
     projected_net = current_net + signed_units
 
@@ -931,7 +878,6 @@ def execute_open_trade(
     try:
         r = place_market_order(instrument=pair, signed_units=signed_units, sl_pips=sl_pips, tp_pips=tp_pips)
         ok = r.ok
-
         body_text = r.text
         resp_json = {}
         try:
@@ -951,7 +897,7 @@ def execute_open_trade(
             meta=json.dumps(meta)
         )
 
-        # 7. Update Trade State (Local Tracking)
+        # 7. Update Trade State
         entry_price = None
         try:
             if resp_json:
@@ -968,14 +914,12 @@ def execute_open_trade(
                 entry_price = None
 
         if ok and entry_price is not None:
-            # We track the new "weighted average" entry implicitly by updating the net unit count and last price.
-            # OANDA handles the actual average price on their backend.
             upsert_trade_state(
                 instrument=pair,
                 is_open=True,
                 side=side,
-                units=abs(projected_net), # Update to new total units
-                entry_price=entry_price,  # This updates the "last entry" price reference
+                units=abs(projected_net),
+                entry_price=entry_price,
                 entry_time_ms=int(time.time() * 1000),
                 last_mark_price=entry_price,
                 unrealized_pl_home=Decimal(0),
@@ -1014,80 +958,15 @@ def execute_open_trade(
 # ============================================================
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "ok": True,
-        "mode": MODE,
-        "trading_enabled": TRADING_ENABLED,
-        "max_units": MAX_UNITS,
-        "max_net_units": MAX_NET_UNITS,
-        "sl_pips_default": SL_PIPS_DEFAULT,
-        "tp_pips_default": TP_PIPS_DEFAULT,
-        "min_sl_pips": MIN_SL_PIPS,
-        "max_sl_pips": MAX_SL_PIPS,
-        "max_tp_pips": MAX_TP_PIPS,
-        "max_spread_pips": MAX_SPREAD_PIPS,
-        "risk_pct": str(RISK_PCT),
-        "max_risk_usd": str(MAX_RISK_USD),
-        "daily_loss_limit_usd": str(DAILY_LOSS_LIMIT_USD),
-        "force_risk_sizing": FORCE_RISK_SIZING,
-        "db_path": DB_PATH,
-        "alert_ttl_seconds": ALERT_TTL_SECONDS,
-        "max_alert_age_seconds": MAX_ALERT_AGE_SECONDS,
-        "gpt_enabled": GPT_ENABLED,
-        "gpt_model": GPT_MODEL,
-        "gpt_min_confidence": GPT_MIN_CONFIDENCE,
-        "gpt_fail_open": GPT_FAIL_OPEN,
-        "gpt_max_units_mult": GPT_MAX_UNITS_MULT,
-        "gpt_timeout_seconds": GPT_TIMEOUT_SECONDS
-    })
-
-@app.route("/positions", methods=["GET"])
-def positions():
-    key = request.args.get("key", "")
-    if key != WEBHOOK_KEY:
-        return {"status": "UNAUTHORIZED"}, 401
-    try:
-        r = oanda_get_open_positions()
-        if not r.ok:
-            return {"status": "OANDA_ERROR", "http_status": r.status_code, "response": r.text}, 502
-        return jsonify({"status": "OK", "response": r.json()})
-    except requests.RequestException as e:
-        return {"status": "NETWORK_ERROR", "error": repr(e)}, 502
-
-@app.route("/trade_state", methods=["GET"])
-def trade_state():
-    key = request.args.get("key", "")
-    if key != WEBHOOK_KEY:
-        return {"status": "UNAUTHORIZED"}, 401
-    pair = request.args.get("pair", "USD_JPY").upper().strip()
-    return jsonify({"status": "OK", "trade_state": get_trade_state(pair)})
-
-@app.route("/executions", methods=["GET"])
-def executions():
-    key = request.args.get("key", "")
-    if key != WEBHOOK_KEY:
-        return {"status": "UNAUTHORIZED"}, 401
-
-    limit = int(request.args.get("limit", "50"))
-    limit = max(1, min(limit, 500))
-
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM executions ORDER BY ts DESC LIMIT ?", (limit,))
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return jsonify({"status": "OK", "executions": rows})
+    return jsonify({"ok": True, "mode": MODE})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     key = request.args.get("key", "")
     if key != WEBHOOK_KEY:
-        log("AUTH BLOCKED | invalid webhook key")
+        log("AUTH BLOCKED")
+        # AUDIT FIX: No DB write, just file log
         return {"status": "UNAUTHORIZED"}, 401
-
-    raw = request.get_data(as_text=True)
-    if raw:
-        log(f"RAW BODY | {raw}")
 
     if not TRADING_ENABLED:
         return {"status": "DISABLED"}, 200
@@ -1095,7 +974,7 @@ def webhook():
     data = request.get_json(silent=True) or {}
     payload, err = validate_payload(data)
     if err:
-        log(f"BAD REQUEST | {err} | {data}")
+        log(f"BAD REQUEST | {err}")
         return {"status": "BAD_REQUEST", "error": err}, 400
 
     alert_id = payload["alert_id"]
@@ -1103,138 +982,162 @@ def webhook():
         log(f"DUPLICATE IGNORED | alert_id={alert_id}")
         db_record_execution(
             alert_id=alert_id, action=payload["action"], instrument=payload.get("pair", "N/A"),
-            side=payload.get("side"), units=None,
-            sl_pips=payload.get("sl_pips"), tp_pips=payload.get("tp_pips"),
-            current_net=None, projected_net=None, spread_pips=None,
-            status="DUPLICATE_IGNORED", oanda_http=None, oanda_response=None, meta=None
+            status="DUPLICATE_IGNORED", meta=None
         )
         return {"status": "DUPLICATE_IGNORED"}, 200
 
     action = payload["action"]
 
-    # CLOSE ALL
     if action == "close_all":
         try:
             results = close_all_positions()
             log(f"CLOSE_ALL | alert_id={alert_id} | closed={len(results)}")
             for item in results:
                 db_record_execution(
-                    alert_id=alert_id,
-                    action="close",
-                    instrument=item["instrument"],
-                    side=None, units=None, sl_pips=None, tp_pips=None,
-                    current_net=None, projected_net=None, spread_pips=None,
-                    oanda_http=item["http_status"],
-                    status=("OK" if item["ok"] else "OANDA_ERROR"),
-                    oanda_response=str(item["response"]),
-                    meta=None
+                    alert_id=alert_id, action="close", instrument=item["instrument"],
+                    oanda_http=item["http_status"], status=("OK" if item["ok"] else "OANDA_ERROR"),
+                    oanda_response=str(item["response"]), meta=None
                 )
             return {"status": "OK", "results": results}, 200
         except Exception as e:
-            log(f"ERROR | CLOSE_ALL | alert_id={alert_id} | {repr(e)}")
-            db_record_execution(
-                alert_id=alert_id, action="close_all", instrument="ALL",
-                status="ERROR", oanda_response=repr(e), oanda_http=None, meta=None
-            )
+            db_record_execution(alert_id=alert_id, action="close_all", instrument="ALL", status="ERROR", oanda_response=repr(e), meta=None)
             return {"status": "ERROR", "error": str(e)}, 502
 
     pair = payload["pair"]
 
-    # CLOSE (single)
     if action == "close":
         try:
             r = close_position(pair)
             log(f"CLOSE | alert_id={alert_id} | {pair} | HTTP {r.status_code}")
+            upsert_trade_state(instrument=pair, is_open=False, side=None, units=None, entry_price=None, entry_time_ms=None, last_mark_price=None, unrealized_pl_home=None, realized_pl_home=None)
+            
+            status = "OK" if r.ok else "OANDA_ERROR"
             db_record_execution(
                 alert_id=alert_id, action="close", instrument=pair,
-                side=None, units=None, sl_pips=None, tp_pips=None,
-                current_net=None, projected_net=None, spread_pips=None,
-                oanda_http=r.status_code, status=("OK" if r.ok else "OANDA_ERROR"),
-                oanda_response=r.text, meta=None
+                oanda_http=r.status_code, status=status, oanda_response=r.text, meta=None
             )
-            # also clear trade_state best-effort
-            upsert_trade_state(
-                instrument=pair,
-                is_open=False,
-                side=None,
-                units=None,
-                entry_price=None,
-                entry_time_ms=None,
-                last_mark_price=None,
-                unrealized_pl_home=None,
-                realized_pl_home=None
-            )
-            return {"status": "OK" if r.ok else "OANDA_ERROR",
-                    "http_status": r.status_code,
-                    "response": (r.json() if r.headers.get("Content-Type","").startswith("application/json") else {"raw": r.text})
-                    }, (200 if r.ok else 502)
+            return {"status": status, "http_status": r.status_code}, (200 if r.ok else 502)
         except requests.RequestException as e:
-            log(f"NETWORK ERROR | CLOSE | alert_id={alert_id} | {pair} | {repr(e)}")
-            db_record_execution(
-                alert_id=alert_id, action="close", instrument=pair,
-                status="NETWORK_ERROR", oanda_response=repr(e), oanda_http=None,
-                side=None, units=None, sl_pips=None, tp_pips=None,
-                current_net=None, projected_net=None, spread_pips=None,
-                meta=None
-            )
+            db_record_execution(alert_id=alert_id, action="close", instrument=pair, status="NETWORK_ERROR", oanda_response=repr(e), meta=None)
             return {"status": "NETWORK_ERROR"}, 502
 
-    # ========================================================
-    # OBSERVE -> GPT DECIDES
-    # ========================================================
     if action == "observe":
         features = payload.get("features", {}) or {}
         hint_sl = payload.get("sl_pips", SL_PIPS_DEFAULT)
         hint_tp = payload.get("tp_pips", TP_PIPS_DEFAULT)
 
-        # Stale alert guard using TradingView bar time_ms
+        # --- Stale Alert Guard ---
         if MAX_ALERT_AGE_SECONDS > 0:
-            try:
-                tv_time_ms = features.get("time_ms", None)
-                if tv_time_ms is not None:
-                    tv_time_ms = int(tv_time_ms)
-                    now_ms = int(time.time() * 1000)
-                    age_sec = (now_ms - tv_time_ms) / 1000.0
+            tv_time_ms = features.get("time_ms")
+            if tv_time_ms is not None:
+                try:
+                    age_sec = (int(time.time() * 1000) - int(tv_time_ms)) / 1000.0
                     if age_sec > MAX_ALERT_AGE_SECONDS:
-                        log(f"STALE_ALERT_IGNORED | alert_id={alert_id} | pair={pair} | age_sec={age_sec:.1f} > {MAX_ALERT_AGE_SECONDS}")
                         db_record_execution(
                             alert_id=alert_id, action="observe", instrument=pair,
-                            side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
-                            current_net=None, projected_net=None, spread_pips=None,
-                            status="STALE_ALERT_IGNORED", oanda_http=None, oanda_response=None,
-                            meta=json.dumps({"age_sec": age_sec, "max_age_sec": MAX_ALERT_AGE_SECONDS, "time_ms": tv_time_ms})
+                            current_net=None, spread_pips=None,
+                            status="STALE_ALERT_IGNORED",
+                            meta=json.dumps({"age_sec": age_sec, "max_age": MAX_ALERT_AGE_SECONDS})
                         )
-                        return {"status": "STALE_ALERT_IGNORED", "age_sec": age_sec, "max_age_sec": MAX_ALERT_AGE_SECONDS}, 200
-            except Exception as e:
-                log(f"STALE_GUARD_PARSE_FAIL | alert_id={alert_id} | {repr(e)}")
+                        return {"status": "STALE_ALERT_IGNORED", "age_sec": age_sec}, 200
+                except Exception:
+                    log(f"STALE_GUARD_PARSE_FAIL | alert_id={alert_id}")
 
-        # Spread best effort
+        # --- OPTIMIZATION STEP 1: Fetch Position State ---
+        try:
+            current_net = get_net_units_for_instrument(pair)
+        except Exception as e:
+            log(f"STATE_FETCH_FAIL | {repr(e)}")
+            return {"status": "STATE_FETCH_FAIL", "error": str(e)}, 503
+
+        # --- OPTIMIZATION STEP 2: Lazy Load NAV/Currency ---
+        nav = None
+        acct_ccy = None
+        
+        # Only fetch account summary if we are already in a trade (needed for UPL)
+        # If we are FLAT (current_net == 0), we skip this heavy call.
+        if current_net != 0:
+             try:
+                 nav, acct_ccy = get_account_nav_and_currency()
+             except Exception:
+                 pass # Don't crash here; we can still trade without live UPL
+
+        # --- PRE-COMPUTE FLAGS ---
+        dist_to_ema = _f(features.get("dist_to_ema_200", 0))
+        adx = _f(features.get("adx", 0))
+        is_overextended = False
+        if abs(dist_to_ema) > 40 and adx < 20:
+             is_overextended = True
+        
+        # --- Robust Trend Bias ---
+        lookback = features.get("lookback", [])
+        trend_bias = "mixed"
+        if lookback and len(lookback) >= 5:
+             recent = lookback[:5] 
+             up_count = sum(1 for c in recent if _f(c.get("close")) > _f(c.get("open")))
+             if up_count >= 4: trend_bias = "bullish"
+             elif up_count <= 1: trend_bias = "bearish"
+        
+        analysis = {
+             "is_overextended": is_overextended,
+             "trend_bias": trend_bias
+        }
+
+        # --- PRE-GATING: NO SETUP (Optimization) ---
+        has_cross = _b(features.get("buyCross")) or _b(features.get("sellCross"))
+        is_strong_trend = adx >= 22
+        
+        if current_net == 0 and not (has_cross or is_strong_trend):
+             # Skip Spread Call + Skip GPT Token Cost
+             db_record_execution(
+                alert_id=alert_id, action="observe", instrument=pair,
+                current_net=current_net, spread_pips=None,
+                status="RULE_SKIP_NO_SETUP", meta=json.dumps({"adx": adx})
+             )
+             return {"status": "RULE_SKIP_NO_SETUP"}, 200
+
+        # --- FETCH PRICING (Now that we know we care) ---
         spread_pips_val = None
         if MAX_SPREAD_PIPS > 0:
             try:
                 spread_pips_val = get_spread_pips(pair)
-            except Exception as e:
-                log(f"PRICE_FETCH_FAIL | alert_id={alert_id} | {pair} | {repr(e)}")
+            except Exception:
                 spread_pips_val = None
+            
+            # --- Unknown Spread Gate ---
+            if spread_pips_val is None:
+                db_record_execution(
+                    alert_id=alert_id, action="observe", instrument=pair,
+                    current_net=None, spread_pips=None,
+                    status="RULE_BLOCKED_SPREAD_UNKNOWN", meta=None
+                )
+                return {"status": "RULE_BLOCKED_SPREAD_UNKNOWN"}, 200
 
-        # Current net + NAV
-        try:
-            current_net = get_net_units_for_instrument(pair)
-            nav, acct_ccy = get_account_nav_and_currency()
-        except Exception as e:
-            log(f"STATE_FETCH_FAIL | alert_id={alert_id} | {repr(e)}")
-            db_record_execution(
+        # --- PRE-GATING: SPREAD & OVEREXTENSION ---
+        dynamic_spread_limit = MAX_SPREAD_PIPS
+        if "XAU" in pair:
+             dynamic_spread_limit = 60.0
+
+        if spread_pips_val is not None and spread_pips_val > dynamic_spread_limit:
+             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
-                side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
-                current_net=None, projected_net=None, spread_pips=spread_pips_val,
-                status="STATE_FETCH_FAIL", oanda_http=None, oanda_response=repr(e),
-                meta=None
-            )
-            return {"status": "STATE_FETCH_FAIL", "error": str(e)}, 503
+                current_net=current_net, spread_pips=spread_pips_val,
+                status="RULE_BLOCKED_SPREAD", meta=json.dumps({"limit": dynamic_spread_limit})
+             )
+             return {"status": "RULE_BLOCKED_SPREAD"}, 200
 
-        # Update mark + UPL in trade_state (if open)
+        if current_net == 0 and is_overextended:
+             db_record_execution(
+                alert_id=alert_id, action="observe", instrument=pair,
+                current_net=current_net, spread_pips=spread_pips_val,
+                status="RULE_BLOCKED_OVEREXTENDED", meta=json.dumps(analysis)
+             )
+             return {"status": "RULE_BLOCKED_OVEREXTENDED"}, 200
+        
+        # --- Update Trade State (UPL) ---
+        # We only update UPL if we have acct_ccy (which we fetched only if current_net != 0)
         ts = get_trade_state(pair)
-        if ts and int(ts.get("is_open", 0)) == 1 and ts.get("entry_price") and ts.get("side") and ts.get("units"):
+        if ts and int(ts.get("is_open", 0)) == 1 and acct_ccy:
             try:
                 mark = get_mid_price(pair)
                 entry = Decimal(str(ts["entry_price"]))
@@ -1242,28 +1145,18 @@ def webhook():
                 units_ts = int(ts["units"])
                 upl = compute_unrealized_pl_home(pair, side_ts, units_ts, entry, mark, acct_ccy)
                 upsert_trade_state(
-                    instrument=pair,
-                    is_open=True,
-                    side=side_ts,
-                    units=units_ts,
-                    entry_price=entry,
-                    entry_time_ms=int(ts.get("entry_time_ms") or (time.time() * 1000)),
-                    last_mark_price=mark,
-                    unrealized_pl_home=upl,
+                    instrument=pair, is_open=True, side=side_ts, units=units_ts,
+                    entry_price=entry, entry_time_ms=int(ts.get("entry_time_ms") or (time.time()*1000)),
+                    last_mark_price=mark, unrealized_pl_home=upl,
                     realized_pl_home=(Decimal(str(ts["realized_pl_home"])) if ts.get("realized_pl_home") else None)
                 )
             except Exception:
                 pass
 
-        # Determine dynamic spread limit for GPT context
-        dynamic_spread_limit = MAX_SPREAD_PIPS
-        if "XAU" in pair:
-            dynamic_spread_limit = 60.0
-
-        # GPT context includes the new lookback array automatically (inside features)
         gpt_ctx = {
             "pair": pair,
             "features": features,
+            "analysis": analysis, 
             "hint": {"sl_pips": hint_sl, "tp_pips": hint_tp},
             "limits": {
                 "min_sl_pips": MIN_SL_PIPS,
@@ -1271,154 +1164,80 @@ def webhook():
                 "max_tp_pips": MAX_TP_PIPS,
                 "max_units": MAX_UNITS,
                 "max_net_units": MAX_NET_UNITS,
-                "max_spread_pips": dynamic_spread_limit, # <--- FIXED (Sends 60.0 for Gold)
+                "max_spread_pips": dynamic_spread_limit,
                 "gpt_max_units_mult": GPT_MAX_UNITS_MULT
             },
-            # ... (rest of dict stays same)
             "state": {
                 "spread_pips": spread_pips_val,
                 "current_net": current_net
             },
             "risk": {
                 "risk_pct": str(RISK_PCT),
-                "max_risk_usd": str(MAX_RISK_USD),
-                "daily_loss_limit_usd": str(DAILY_LOSS_LIMIT_USD)
+                "max_risk_usd": str(MAX_RISK_USD)
             }
         }
 
         gpt_decision = gpt_decide_trade(gpt_ctx)
 
-        # Confidence gate
-        if gpt_decision["confidence"] < GPT_MIN_CONFIDENCE:
-            log(f"GPT_HOLD_LOW_CONF | alert_id={alert_id} | {pair} | {gpt_decision}")
+        if gpt_decision["confidence"] < GPT_MIN_CONFIDENCE or gpt_decision["action"] == "HOLD":
             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
                 side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
                 current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                status="GPT_HOLD_LOW_CONF", oanda_http=None, oanda_response=None,
+                status=f"GPT_{gpt_decision['action']}", oanda_http=None, oanda_response=None,
                 meta=json.dumps(gpt_decision)
             )
-            return {"status": "GPT_HOLD_LOW_CONF", "decision": gpt_decision}, 200
+            return {"status": f"GPT_{gpt_decision['action']}", "decision": gpt_decision}, 200
 
-        # HOLD
-        if gpt_decision["action"] == "HOLD":
-            db_record_execution(
-                alert_id=alert_id, action="observe", instrument=pair,
-                side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
-                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                status="GPT_HOLD", oanda_http=None, oanda_response=None,
-                meta=json.dumps(gpt_decision)
-            )
-            return {"status": "GPT_HOLD", "decision": gpt_decision}, 200
-
-        # CLOSE
         if gpt_decision["action"] == "CLOSE":
             try:
-                # try compute realized PnL using last mark if available
-                ts_before = get_trade_state(pair)
-                realized = None
-
                 r = close_position(pair)
-                ok = r.ok
-
-                # Attempt to compute realized from last mark and entry
-                try:
-                    if ts_before and int(ts_before.get("is_open", 0)) == 1:
-                        entry = Decimal(str(ts_before["entry_price"]))
-                        side_ts = str(ts_before["side"])
-                        units_ts = int(ts_before["units"])
-                        # use mid at close moment as approximation
-                        mark = get_mid_price(pair)
-                        realized = compute_unrealized_pl_home(pair, side_ts, units_ts, entry, mark, acct_ccy)
-                except Exception:
-                    realized = None
-
-                # Clear trade state and store realized
-                upsert_trade_state(
-                    instrument=pair,
-                    is_open=False,
-                    side=None,
-                    units=None,
-                    entry_price=None,
-                    entry_time_ms=None,
-                    last_mark_price=None,
-                    unrealized_pl_home=None,
-                    realized_pl_home=realized
-                )
-
+                upsert_trade_state(instrument=pair, is_open=False, side=None, units=None, entry_price=None, entry_time_ms=None, last_mark_price=None, unrealized_pl_home=None, realized_pl_home=None)
+                
+                status = "OK" if r.ok else "OANDA_ERROR"
                 db_record_execution(
-                    alert_id=alert_id, action="close", instrument=pair,
-                    side=None, units=None, sl_pips=None, tp_pips=None,
-                    current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                    oanda_http=r.status_code, status=("OK" if ok else "OANDA_ERROR"),
-                    oanda_response=r.text,
-                    meta=json.dumps({"gpt": gpt_decision, "realized_pl_home_est": (str(realized) if realized is not None else None)})
+                    alert_id=alert_id, action="close", instrument=pair, side=None, units=None, sl_pips=None, tp_pips=None, current_net=current_net, projected_net=None, spread_pips=spread_pips_val, oanda_http=r.status_code, status=status, oanda_response=r.text, meta=json.dumps(gpt_decision)
                 )
-                return {
-                    "status": "OK" if ok else "OANDA_ERROR",
-                    "action": "close",
-                    "http_status": r.status_code,
-                    "instrument": pair,
-                    "decision": gpt_decision,
-                    "realized_pl_home_est": (str(realized) if realized is not None else None),
-                    "response": (r.json() if r.headers.get("Content-Type","").startswith("application/json") else {"raw": r.text})
-                }, (200 if ok else 502)
-
+                return {"status": status, "action": "close"}, (200 if r.ok else 502)
             except Exception as e:
-                db_record_execution(
-                    alert_id=alert_id, action="close", instrument=pair,
-                    side=None, units=None, sl_pips=None, tp_pips=None,
-                    current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                    status="ERROR", oanda_http=None, oanda_response=repr(e),
-                    meta=json.dumps(gpt_decision)
-                )
-                return {"status": "ERROR", "action": "close", "error": str(e), "decision": gpt_decision}, 502
+                db_record_execution(alert_id=alert_id, action="close", instrument=pair, status="ERROR", oanda_response=str(e), meta=json.dumps(gpt_decision))
+                return {"status": "ERROR", "error": str(e)}, 502
 
-        # DELETE OR COMMENT OUT THIS BLOCK TO ALLOW MULTIPLE POSITIONS
-        # One-position-at-a-time: block OPEN if already in position
-        # if gpt_decision["action"] == "OPEN" and current_net != 0:
-        #     log(f"GPT_HOLD_ALREADY_IN_POSITION | alert_id={alert_id} | {pair} | net={current_net} | {gpt_decision}")
-        #     db_record_execution(
-        #         alert_id=alert_id, action="observe", instrument=pair,
-        #         side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
-        #         current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-        #         status="GPT_HOLD_ALREADY_IN_POSITION", oanda_http=None, oanda_response=None,
-        #         meta=json.dumps(gpt_decision)
-        #     )
-        #     return {"status": "GPT_HOLD_ALREADY_IN_POSITION", "decision": gpt_decision}, 200
-
-        # OPEN (only when flat)
         if gpt_decision["action"] == "OPEN":
-            # --- NEW: PYRAMIDING COOL-DOWN CHECK ---
+            # Cooldown check
             cooldown_min = int(os.getenv("PYRAMID_COOLDOWN_MINUTES", "15"))
             if current_net != 0 and not check_cooldown(pair, cooldown_min):
-                log(f"COOLDOWN_ACTIVE | alert_id={alert_id} | {pair} | Last trade too recent (<{cooldown_min}m)")
-                db_record_execution(
-                    alert_id=alert_id, action="observe", instrument=pair,
-                    side=None, units=None, sl_pips=None, tp_pips=None,
-                    current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                    status="COOLDOWN_ACTIVE", oanda_http=None, oanda_response=None,
-                    meta=json.dumps(gpt_decision)
-                )
-                return {"status": "COOLDOWN_ACTIVE", "wait_minutes": cooldown_min}, 200
+                log(f"COOLDOWN_ACTIVE | {pair}")
+                db_record_execution(alert_id=alert_id, action="observe", instrument=pair, status="COOLDOWN_ACTIVE", meta=json.dumps(gpt_decision))
+                return {"status": "COOLDOWN_ACTIVE"}, 200
             
+            # Validate Side
             side = gpt_decision["side"]
             if side not in ("buy", "sell"):
-                db_record_execution(
-                    alert_id=alert_id, action="observe", instrument=pair,
-                    side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
-                    current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                    status="GPT_HOLD_BAD_SIDE", oanda_http=None, oanda_response=None,
-                    meta=json.dumps(gpt_decision)
-                )
-                return {"status": "GPT_HOLD_BAD_SIDE", "decision": gpt_decision}, 200
+                 db_record_execution(alert_id=alert_id, action="observe", instrument=pair, status="GPT_INVALID_SIDE", meta=json.dumps(gpt_decision))
+                 return {"status": "GPT_INVALID_SIDE"}, 200
 
+            # --- P0 FIX: Careful with 0 vs None Fallback ---
             sl_pips = gpt_decision["sl_pips"] if gpt_decision["sl_pips"] is not None else hint_sl
             tp_pips = gpt_decision["tp_pips"] if gpt_decision["tp_pips"] is not None else hint_tp
+            
             sl_pips = int(max(MIN_SL_PIPS, min(sl_pips, MAX_SL_PIPS)))
             tp_pips = int(max(0, min(tp_pips, MAX_TP_PIPS)))
 
             meta = {"gpt": gpt_decision, "features": features}
+            
+            # --- OPTIMIZATION STEP 3: Late-Load NAV if needed for Opening ---
+            if nav is None:
+                try:
+                    nav, acct_ccy = get_account_nav_and_currency()
+                except Exception as e:
+                    log(f"NAV FETCH FAIL | {e}")
+                    db_record_execution(
+                        alert_id=alert_id, action="open", instrument=pair, side=side,
+                        status="NAV_FETCH_FAIL", meta=json.dumps(meta)
+                    )
+                    return {"status": "NAV_FETCH_FAIL", "error": str(e)}, 503
+
             resp, status = execute_open_trade(
                 alert_id=alert_id,
                 pair=pair,
@@ -1434,70 +1253,7 @@ def webhook():
             )
             return resp, status
 
-        db_record_execution(
-            alert_id=alert_id, action="observe", instrument=pair,
-            side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
-            current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-            status="GPT_HOLD_UNKNOWN", oanda_http=None, oanda_response=None,
-            meta=json.dumps(gpt_decision)
-        )
-        return {"status": "GPT_HOLD_UNKNOWN", "decision": gpt_decision}, 200
-
-    # Manual OPEN (optional) — kept from your version
-    if action == "open":
-        side = payload["side"]
-        sl_pips = payload["sl_pips"]
-        tp_pips = payload["tp_pips"]
-        features = payload.get("features", {}) or {}
-
-        spread_pips_val = None
-        if MAX_SPREAD_PIPS > 0:
-            try:
-                spread_pips_val = get_spread_pips(pair)
-            except Exception:
-                spread_pips_val = None
-
-        try:
-            current_net = get_net_units_for_instrument(pair)
-            nav, acct_ccy = get_account_nav_and_currency()
-        except Exception as e:
-            db_record_execution(
-                alert_id=alert_id, action="open", instrument=pair, side=side,
-                units=None, sl_pips=sl_pips, tp_pips=tp_pips,
-                current_net=None, projected_net=None, spread_pips=spread_pips_val,
-                status="RISK_BLOCKED_STATE_FETCH_FAIL", oanda_http=None, oanda_response=repr(e),
-                meta=None
-            )
-            return {"status": "RISK_BLOCKED_STATE_FETCH_FAIL", "error": str(e)}, 503
-
-        if current_net != 0:
-            db_record_execution(
-                alert_id=alert_id, action="open", instrument=pair, side=side,
-                units=None, sl_pips=sl_pips, tp_pips=tp_pips,
-                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                status="MANUAL_BLOCKED_ALREADY_IN_POSITION", oanda_http=None, oanda_response=None,
-                meta=json.dumps({"current_net": current_net})
-            )
-            return {"status": "MANUAL_BLOCKED_ALREADY_IN_POSITION", "current_net": current_net}, 200
-
-        meta = {"manual": True, "features": features}
-        resp, status = execute_open_trade(
-            alert_id=alert_id,
-            pair=pair,
-            side=side,
-            sl_pips=sl_pips,
-            tp_pips=tp_pips,
-            units_mult=1.0,
-            spread_pips_val=spread_pips_val,
-            current_net=current_net,
-            nav=nav,
-            acct_ccy=acct_ccy,
-            meta=meta
-        )
-        return resp, status
-
-    return {"status": "BAD_REQUEST", "error": "Unhandled action"}, 400
-
+    return {"status": "BAD_REQUEST"}, 400
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)

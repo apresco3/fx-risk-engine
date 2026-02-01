@@ -13,4 +13,5 @@ venv/
 .venv/
 
 # Runtime state
+bot_old.db
 bot.db
