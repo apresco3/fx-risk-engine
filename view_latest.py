@@ -4,9 +4,27 @@ import os
 import textwrap
 import datetime
 import time
+from dotenv import load_dotenv
 from decimal import Decimal
 
+load_dotenv()
+
+# --- OANDA IMPORTS ---
+try:
+    import oandapyV20
+    import oandapyV20.endpoints.trades as trades
+    from oandapyV20 import API
+    OANDA_AVAILABLE = True
+except ImportError:
+    OANDA_AVAILABLE = False
+    print("WARNING: 'oandapyV20' not installed. Live audit will be skipped.")
+    print("Run: pip install oandapyV20")
+
+# --- CONFIGURATION ---
 DB_PATH = "bot.db"
+# Ensure these match your bot's settings.py or .env
+ACCESS_TOKEN = os.getenv("OANDA_TOKEN")
+ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 
 
 def _safe_json_loads(s: str):
@@ -149,7 +167,6 @@ def _fmt_ts_both(ts: int) -> tuple[str, str]:
 
 
 def pip_size_for(instrument: str) -> Decimal:
-    # Must mirror bot.py (after fix)
     if "XAU" in instrument:
         return Decimal("0.1")
     if instrument.endswith("_JPY"):
@@ -183,6 +200,24 @@ def print_execution(title, data, meta):
     print("-" * 20)
 
 
+def get_oanda_trades():
+    """Fetches individual tickets directly from OANDA API."""
+    if not OANDA_AVAILABLE:
+        return None
+    if not ACCESS_TOKEN or not ACCOUNT_ID:
+        print("\n[!] Cannot fetch Live Tickets: OANDA_ACCESS_TOKEN or OANDA_ACCOUNT_ID missing from environment.")
+        return None
+
+    try:
+        client = API(access_token=ACCESS_TOKEN)
+        r = trades.TradesList(accountID=ACCOUNT_ID, params={"state": "OPEN"})
+        client.request(r)
+        return r.response.get("trades", [])
+    except Exception as e:
+        print(f"\n[!] Error contacting OANDA API: {e}")
+        return None
+
+
 def main():
     if not os.path.exists(DB_PATH):
         print(f"Database not found at {DB_PATH}")
@@ -192,6 +227,7 @@ def main():
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
+    # 1. Fetch Latest Execution Logs
     cutoff_ts = int(time.time() - 86400)
     query_logs = """
         SELECT e.* FROM executions e
@@ -206,12 +242,14 @@ def main():
     cur.execute(query_logs, (cutoff_ts,))
     recent_rows = cur.fetchall()
 
+    # 2. Fetch Portfolio from Database (Aggregated State)
     query_portfolio = "SELECT * FROM trade_state WHERE is_open = 1 ORDER BY instrument ASC"
     cur.execute(query_portfolio)
     active_trades = cur.fetchall()
 
     conn.close()
 
+    # --- PRINT SYSTEM STATUS ---
     print("\n" + "#" * 60)
     print(" SYSTEM STATUS (Last Report per Pair)")
     print("#" * 60)
@@ -224,14 +262,16 @@ def main():
             meta = _safe_json_loads(data["meta"]) if data.get("meta") else {}
             print_execution(f"LATEST LOG: {data['instrument']}", data, meta)
 
+    # --- PRINT DATABASE PORTFOLIO ---
     print("\n\n" + "#" * 60)
-    print(" 💰 ACTIVE PORTFOLIO (Open Trades Only)")
+    print(" 🤖 ACTIVE PORTFOLIO (Bot Internal State)")
     print("#" * 60)
+    print("(Aggregated Net Positions tracked by bot logic)")
 
     acct_ccy = os.getenv("ACCOUNT_CURRENCY", "USD")
 
     if not active_trades:
-        print("\n[FLAT] No open trades currently.")
+        print("\n[FLAT] No open trades in Bot DB.")
     else:
         for row in active_trades:
             t = dict(row)
@@ -257,16 +297,40 @@ def main():
             except Exception:
                 pips = None
 
-            print(f"\n>>> OPEN POSITION: {t['instrument']}")
+            print(f"\n>>> NET POSITION: {t['instrument']}")
             print(f"    SIDE:        {str(t['side']).upper()}")
-            print(f"    UNITS:       {t['units']}")
-            print(f"    ENTRY PRICE: {t['entry_price']}")
+            print(f"    NET UNITS:   {t['units']}")
+            print(f"    AVG ENTRY:   {t['entry_price']}")
             print(f"    MARK PRICE:  {t.get('last_mark_price', 'N/A')}")
             if pips is not None:
                 print(f"    PIPS (Est):  {pips:+.1f}")
             print(f"    DURATION:    {duration_str}")
             print(f"    UPL (Est):   {t.get('unrealized_pl_home', '0.00')} {acct_ccy}")
             print("-" * 40)
+
+    # --- PRINT LIVE OANDA TICKETS ---
+    if OANDA_AVAILABLE:
+        print("\n\n" + "#" * 60)
+        print(" 🏦 LIVE OANDA TICKETS (Broker Source of Truth)")
+        print("#" * 60)
+        print("(Individual tickets currently open on OANDA account)")
+        
+        live_trades = get_oanda_trades()
+        
+        if live_trades is None:
+            print("[INFO] Live fetch skipped (config missing or network error).")
+        elif not live_trades:
+            print("\n[FLAT] No open tickets found on OANDA.")
+        else:
+            print(f"\n{'TICKET':<10} {'INSTRUMENT':<12} {'UNITS':<10} {'ENTRY':<10} {'UPL':<10}")
+            print("-" * 55)
+            for t in live_trades:
+                tid = t.get('id', 'N/A')
+                instr = t.get('instrument', 'N/A')
+                units = t.get('currentUnits', '0')
+                price = t.get('price', '0')
+                upl = t.get('unrealizedPL', '0.00')
+                print(f"{tid:<10} {instr:<12} {units:<10} {price:<10} {upl:<10}")
 
 
 if __name__ == "__main__":

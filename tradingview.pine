@@ -142,6 +142,7 @@ if can_fire
             "\"close\":" + fnum(close) + "," +
             "\"rsi\":" + fnum(rsi) + "," +
             "\"adx\":" + fnum(adx) + "," +
+            "\"atr\":" + fnum(atr) + "," +             
             "\"atr_pips\":" + fnum(atr_pips) + "," +
             "\"ema_sep_pips\":" + fnum(ema_sep_pips) + "," +
             "\"fast_slope_pips\":" + fnum(fast_slope_p) + "," +

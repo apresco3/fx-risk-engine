@@ -220,6 +220,7 @@ SL_PIPS_DEFAULT = int(os.getenv("SL_PIPS", "20"))
 TP_PIPS_DEFAULT = int(os.getenv("TP_PIPS", "40"))
 MAX_SL_PIPS = int(os.getenv("MAX_SL_PIPS", str(SL_PIPS_DEFAULT)))
 MAX_TP_PIPS = int(os.getenv("MAX_TP_PIPS", str(TP_PIPS_DEFAULT)))
+TP_ATR_MULTIPLIER = float(os.getenv("TP_ATR_MULTIPLIER", "1.5"))
 MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "1"))
 
 MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))
@@ -1416,11 +1417,43 @@ def webhook():
                 db_record_execution(alert_id=alert_id, action="observe", instrument=pair, status="GPT_INVALID_SIDE", meta=json.dumps(gpt_decision))
                 return {"status": "GPT_INVALID_SIDE"}, 200
 
+            # -------------------------------------------------------------
+            # DYNAMIC TP LOGIC START
+            # -------------------------------------------------------------
+            # 1. Establish Baselines
             sl_pips = gpt_decision["sl_pips"] if gpt_decision["sl_pips"] is not None else hint_sl
-            tp_pips = gpt_decision["tp_pips"] if gpt_decision["tp_pips"] is not None else hint_tp
+            default_tp = gpt_decision["tp_pips"] if gpt_decision["tp_pips"] is not None else hint_tp
             
+            # 2. Extract ATR from features (sent by TradingView)
+            atr_val = _f(features.get("atr", 0))
+
+            if atr_val > 0:
+                # 3. Convert ATR Price -> Pips
+                # pip_size_for returns Decimal, cast to float for calculation
+                pip_unit = float(pip_size_for(pair))
+                
+                # Example: 0.0015 price / 0.0001 pip_unit = 15.0 pips
+                atr_in_pips = atr_val / pip_unit
+                
+                # 4. Apply Multiplier
+                # Make sure TP_ATR_MULTIPLIER is defined in Config area, or default to 1.5 here
+                multiplier = float(os.getenv("TP_ATR_MULTIPLIER", "1.5"))
+                dynamic_tp = int(atr_in_pips * multiplier)
+                
+                # 5. Enforce Floor (e.g. 10 pips) to prevent spread killing the trade
+                tp_pips = max(10, dynamic_tp)
+                
+                log(f"DYNAMIC_TP | {pair} | ATR={atr_val} ({atr_in_pips:.1f} pips) | Mult={multiplier} | TP={tp_pips}")
+            else:
+                # Fallback to GPT decision or hint if ATR missing
+                tp_pips = default_tp
+
+            # 6. Apply Safety Caps (Min/Max limits from env)
             sl_pips = int(max(MIN_SL_PIPS, min(sl_pips, MAX_SL_PIPS)))
             tp_pips = int(max(0, min(tp_pips, MAX_TP_PIPS)))
+            # -------------------------------------------------------------
+            # DYNAMIC TP LOGIC END
+            # -------------------------------------------------------------
 
             meta = {"gpt": gpt_decision, "features": features}
             
