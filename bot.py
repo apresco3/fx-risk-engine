@@ -1050,6 +1050,17 @@ def webhook():
             log(f"STATE_FETCH_FAIL | {repr(e)}")
             return {"status": "STATE_FETCH_FAIL", "error": str(e)}, 503
 
+        # If OANDA says 0, but DB thinks we are open, force close the DB record.
+        if current_net == 0:
+            ts = get_trade_state(pair)
+            if ts and int(ts.get("is_open", 0)) == 1:
+                log(f"AUTO-SYNC | {pair} is flat on OANDA but open in DB. Syncing...")
+                upsert_trade_state(
+                    instrument=pair, is_open=False, side=None, units=None, 
+                    entry_price=None, entry_time_ms=None, last_mark_price=None, 
+                    unrealized_pl_home=None, realized_pl_home=None
+                )
+
         # --- OPTIMIZATION STEP 2: Lazy Load NAV/Currency ---
         nav = None
         acct_ccy = None
