@@ -2,6 +2,8 @@ import sqlite3
 import json
 import os
 import textwrap
+import datetime
+import time
 
 DB_PATH = "bot.db"
 
@@ -10,6 +12,99 @@ def _safe_json_loads(s: str):
         return json.loads(s)
     except Exception:
         return {}
+
+def format_reason(data, meta):
+    """
+    Prefer GPT reason/confidence when present.
+    Otherwise derive a human reason from status/spread/meta.
+    """
+    gpt_reason = None
+    confidence = None
+
+    # OPEN meta often nested: {"gpt": {...}, "features": {...}}
+    if isinstance(meta, dict) and "gpt" in meta and isinstance(meta["gpt"], dict):
+        gpt_reason = meta["gpt"].get("reason")
+        confidence = meta["gpt"].get("confidence")
+
+    # HOLD/CLOSE meta often flat
+    elif isinstance(meta, dict) and ("reason" in meta or "confidence" in meta):
+        gpt_reason = meta.get("reason")
+        confidence = meta.get("confidence")
+
+    # If GPT did not provide a reason, derive from status
+    if not gpt_reason:
+        status = str(data.get("status", "")).upper()
+        spread = data.get("spread_pips", None)
+
+        if status == "RULE_BLOCKED_SPREAD":
+            limit = "N/A"
+            if isinstance(meta, dict):
+                limit = meta.get("limit", meta.get("max_spread_pips", "N/A"))
+            if spread is not None:
+                gpt_reason = f"Spread too wide: {spread} pips > limit {limit}"
+            else:
+                gpt_reason = f"Spread too wide (limit {limit})"
+
+        elif status == "RULE_BLOCKED_SPREAD_UNKNOWN":
+            gpt_reason = "Spread unknown: pricing fetch failed."
+
+        elif status == "RULE_BLOCKED_OVEREXTENDED":
+            gpt_reason = "Blocked: overextended entry (mean-reversion risk)."
+
+        elif status == "COOLDOWN_ACTIVE":
+            gpt_reason = "Cooldown active: suppressed re-entry/pyramiding."
+
+        elif status == "STALE_ALERT_IGNORED":
+            if isinstance(meta, dict) and "age_sec" in meta and "max_age" in meta:
+                gpt_reason = f"Stale alert ignored: age {meta['age_sec']:.1f}s > max {meta['max_age']}s"
+            else:
+                gpt_reason = "Stale alert ignored."
+
+        elif status == "DUPLICATE_IGNORED":
+            gpt_reason = "Duplicate alert_id ignored."
+
+        elif status.startswith("RISK_BLOCKED_"):
+            gpt_reason = status
+
+        elif status == "RISK_CALC_ERROR":
+            gpt_reason = "Risk sizing calculation error."
+
+        elif status == "OANDA_ERROR":
+            gpt_reason = "OANDA returned error (see executions.oanda_response)."
+
+        elif status == "NETWORK_ERROR":
+            gpt_reason = "Network error when calling OANDA."
+
+        else:
+            gpt_reason = "No reason found in meta."
+
+    if confidence is None:
+        confidence = "N/A"
+
+    return gpt_reason, confidence
+
+def _fmt_ts_both(ts: int) -> tuple[str, str]:
+    dt_local = datetime.datetime.fromtimestamp(ts)
+    dt_utc = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    return dt_local.strftime("%Y-%m-%d %H:%M:%S"), dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+def print_execution(title, data, meta):
+    gpt_reason, confidence = format_reason(data, meta)
+
+    ts = int(data.get("ts", 0) or 0)
+    local_str, utc_str = _fmt_ts_both(ts)
+
+    print("\n" + "="*60)
+    print(f" {title}: {str(data.get('action', '')).upper()} on {data['instrument']} ({data.get('status', 'N/A')})")
+    print("="*60)
+    print(f"TIME (LOCAL): {local_str}")
+    print(f"TIME (UTC):   {utc_str} UTC")
+    print(f"CONFIDENCE:   {confidence}")
+    print(f"SPREAD:       {data.get('spread_pips', 'N/A')}")
+    print("\nREASONING:")
+    print("-" * 20)
+    print(textwrap.fill(str(gpt_reason), width=80))
+    print("-" * 20)
 
 def main():
     if not os.path.exists(DB_PATH):
@@ -20,58 +115,65 @@ def main():
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM executions ORDER BY ts DESC LIMIT 2")
-    rows = cur.fetchall()
+    # --- SECTION 1: SYSTEM STATUS (latest per instrument in last 24h) ---
+    cutoff_ts = int(time.time() - 86400)
+    query_logs = """
+        SELECT e.* FROM executions e
+        JOIN (
+            SELECT instrument, MAX(ts) as max_ts
+            FROM executions
+            WHERE ts > ?
+            GROUP BY instrument
+        ) latest ON e.instrument = latest.instrument AND e.ts = latest.max_ts
+        ORDER BY e.instrument ASC
+    """
+    cur.execute(query_logs, (cutoff_ts,))
+    recent_rows = cur.fetchall()
+
+    # --- SECTION 2: ACTIVE PORTFOLIO ---
+    query_portfolio = "SELECT * FROM trade_state WHERE is_open = 1 ORDER BY instrument ASC"
+    cur.execute(query_portfolio)
+    active_trades = cur.fetchall()
+
     conn.close()
 
-    if not rows:
-        print("No executions found.")
-        return
+    print("\n" + "#"*60)
+    print(" SYSTEM STATUS (Last Report per Pair)")
+    print("#"*60)
 
-    for i, row in enumerate(rows):
-        data = dict(row)
+    if not recent_rows:
+        print("No activity in last 24 hours.")
+    else:
+        for row in recent_rows:
+            data = dict(row)
+            meta = _safe_json_loads(data["meta"]) if data.get("meta") else {}
+            print_execution(f"LATEST LOG: {data['instrument']}", data, meta)
 
-        meta = _safe_json_loads(data["meta"]) if data.get("meta") else {}
+    print("\n\n" + "#"*60)
+    print(" 💰 ACTIVE PORTFOLIO (Open Trades Only)")
+    print("#"*60)
 
-        # Default outputs
-        gpt_reason = "No reason text found."
-        confidence = "N/A"
+    if not active_trades:
+        print("\n[FLAT] No open trades currently.")
+    else:
+        for row in active_trades:
+            t = dict(row)
 
-        # 1) OPEN trades often store meta={"gpt": {...}, "features": {...}}
-        if isinstance(meta, dict) and "gpt" in meta and isinstance(meta["gpt"], dict):
-            gpt_reason = meta["gpt"].get("reason", gpt_reason)
-            confidence = meta["gpt"].get("confidence", confidence)
+            entry_ms = t.get("entry_time_ms")
+            if entry_ms:
+                entry_time = datetime.datetime.fromtimestamp(entry_ms / 1000.0)
+                duration = datetime.datetime.now() - entry_time
+                duration_str = str(duration).split('.')[0]
+            else:
+                duration_str = "N/A"
 
-        # 2) HOLD/CLOSE often store meta flat: {"reason": "...", "confidence": 0.xx}
-        elif isinstance(meta, dict) and "reason" in meta:
-            gpt_reason = meta.get("reason", gpt_reason)
-            confidence = meta.get("confidence", confidence)
-
-        # 3) RULE BLOCKS: you often store meta like {"limit": 60.0} (no "reason")
-        # Add a helpful fallback based on status + known keys.
-        else:
-            status = str(data.get("status", "")).upper()
-            spread = data.get("spread_pips", None)
-            if status == "RULE_BLOCKED_SPREAD":
-                limit = meta.get("limit", "N/A") if isinstance(meta, dict) else "N/A"
-                if spread is not None:
-                    gpt_reason = f"Spread too wide: {spread} pips > limit {limit}"
-                else:
-                    gpt_reason = f"Spread too wide (limit {limit})"
-            elif status == "RULE_BLOCKED_SPREAD_UNKNOWN":
-                gpt_reason = "Spread unknown: pricing fetch failed."
-            elif status == "RULE_BLOCKED_OVEREXTENDED":
-                gpt_reason = "Blocked: overextended entry (mean-reversion risk)."
-
-        print("\n" + "="*60)
-        print(f" LATEST #{i+1}: {data['action'].upper()} on {data['instrument']} ({data['status']})")
-        print("="*60)
-        print(f"CONFIDENCE: {confidence}")
-        print(f"SPREAD: {data.get('spread_pips', 'N/A')}")
-        print("\nFULL REASONING:")
-        print("-" * 20)
-        print(textwrap.fill(str(gpt_reason), width=80))
-        print("-" * 20)
+            print(f"\n>>> OPEN POSITION: {t['instrument']}")
+            print(f"    SIDE:        {str(t['side']).upper()}")
+            print(f"    UNITS:       {t['units']}")
+            print(f"    ENTRY PRICE: {t['entry_price']}")
+            print(f"    DURATION:    {duration_str}")
+            print(f"    UPL (Est):   {t.get('unrealized_pl_home', '0.00')} {os.getenv('ACCOUNT_CURRENCY', 'USD')}")
+            print("-" * 40)
 
 if __name__ == "__main__":
     main()

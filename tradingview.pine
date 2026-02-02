@@ -2,10 +2,11 @@
 // © ashtpres
 
 //@version=6
-indicator("Bot alerts (EVERY CANDLE) + lookback + key levels", overlay=true)
+indicator("Bot alerts (EVERY CANDLE) + lookback + key levels (ALL PAIRS)", overlay=true)
 
 // ====== INPUTS ======
 pair_input  = input.string("USD_JPY", "OANDA Pair", confirm=true)
+
 sl_pips     = input.int(25, "Default SL pips", minval=1)
 tp_pips     = input.int(50, "Default TP pips", minval=0)
 max_sl_pips = input.int(25, "MAX SL pips", minval=1)
@@ -36,6 +37,8 @@ pipSize =
      0.0001
 
 // ====== FORMATTERS (reduce payload size) ======
+// NOTE: Use fnum (5 decimals) for OHLC in lookback to avoid rounding errors (esp JPY)
+// fnum2 is okay for some derived features, but OHLC should be higher precision.
 fnum(x)  => str.tostring(x, "#.#####")
 fnum2(x) => str.tostring(x, "#.##")
 
@@ -79,12 +82,12 @@ price_change_3_bars_pips = (close - close[3]) / pipSize
 ready = (bar_index >= ema200Len) and (bar_index >= lookback_n) and not na(ema200) and not na(adx) and not na(rsi)
 
 // ====== SMART TRIGGER LOGIC (Kept for payload, but NOT for gating) ======
-isTrendStart = (adx > 20) and (adx[1] <= 20)
+isTrendStart  = (adx > 20) and (adx[1] <= 20)
 overext_thresh = str.contains(pair_input, "XAU") ? overext_xau_pips : overext_fx_pips
 overext_now    = math.abs(dist_to_ema_200) > overext_thresh
 overext_enter  = overext_now and not overext_now[1]
 overext_exit   = (not overext_now) and overext_now[1]
-trendFlipped = (trendUp and not trendUp[1]) or (trendDown and not trendDown[1])
+trendFlipped   = (trendUp and not trendUp[1]) or (trendDown and not trendDown[1])
 
 // We keep this to show yellow lines on the chart, but we don't use it to stop the alert
 shouldTrigger = buyCross or sellCross or isTrendStart or trendFlipped or overext_enter or overext_exit
@@ -96,10 +99,11 @@ get_lookback_json(int n) =>
         s += "{"
         s += "\"i\":"          + str.tostring(i) + ","
         s += "\"time_ms\":"    + str.tostring(time[i]) + ","
-        s += "\"open\":"       + fnum2(open[i]) + ","
-        s += "\"high\":"       + fnum2(high[i]) + ","
-        s += "\"low\":"        + fnum2(low[i]) + ","
-        s += "\"close\":"      + fnum2(close[i]) + ","
+        // IMPORTANT: 5-decimal precision on OHLC to avoid rounding candles to doji
+        s += "\"open\":"       + fnum(open[i]) + ","
+        s += "\"high\":"       + fnum(high[i]) + ","
+        s += "\"low\":"        + fnum(low[i]) + ","
+        s += "\"close\":"      + fnum(close[i]) + ","
         s += "\"rsi\":"        + fnum(rsi[i]) + ","
         s += "\"adx\":"        + fnum(adx[i]) + ","
         s += "\"range_pips\":" + fnum(range_pips[i]) + ","
@@ -112,7 +116,7 @@ get_lookback_json(int n) =>
     s
 
 // ====== MAIN ALERT JSON ======
-// MODIFIED: Removed 'and shouldTrigger'. Now fires on every bar close if ready.
+// Fires on every bar close if ready.
 can_fire = (
     ready and
     (sl_pips <= max_sl_pips) and
@@ -131,10 +135,11 @@ if can_fire
             "\"time_ms\":" + str.tostring(time) + "," +
             "\"volume\":" + str.tostring(volume) + "," +
             "\"range_pips\":" + fnum(range_pips) + "," +
-            "\"open\":" + fnum2(open) + "," +
-            "\"high\":" + fnum2(high) + "," +
-            "\"low\":" + fnum2(low) + "," +
-            "\"close\":" + fnum2(close) + "," +
+            // For snapshot OHLC: also use fnum (5 decimals) for consistency
+            "\"open\":" + fnum(open) + "," +
+            "\"high\":" + fnum(high) + "," +
+            "\"low\":" + fnum(low) + "," +
+            "\"close\":" + fnum(close) + "," +
             "\"rsi\":" + fnum(rsi) + "," +
             "\"adx\":" + fnum(adx) + "," +
             "\"atr_pips\":" + fnum(atr_pips) + "," +
@@ -165,5 +170,5 @@ plot(ema200, color=color.gray, title="EMA 200", linewidth=2)
 plotshape(buyCross,  title="BuyCross",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small)
 plotshape(sellCross, title="SellCross", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
 
-// Visual indicator for when the bot WOULD fire
-bgcolor((ready and shouldTrigger) ? color.new(color.yellow, 90) : na, title="Alert Triggered")
+// Visual indicator for when the bot WOULD fire a "Smart" alert (Yellow stripes)
+bgcolor((ready and shouldTrigger) ? color.new(color.yellow, 90) : na, title="Smart Alert Visual")

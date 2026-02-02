@@ -222,6 +222,7 @@ MAX_TP_PIPS = int(os.getenv("MAX_TP_PIPS", str(TP_PIPS_DEFAULT)))
 MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "1"))
 
 MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))
+MIN_EMA_SEP_PIPS = float(os.getenv("MIN_EMA_SEP_PIPS", "0.9"))  # NEW: Anti-chop floor
 
 RISK_PCT = Decimal(os.getenv("RISK_PCT", "0.0025"))
 MAX_RISK_USD = Decimal(os.getenv("MAX_RISK_USD", "100"))
@@ -1111,6 +1112,41 @@ def webhook():
                 status="RULE_BLOCKED_SPREAD", meta=json.dumps({"limit": dynamic_spread_limit})
              )
              return {"status": "RULE_BLOCKED_SPREAD"}, 200
+        
+        # ============================================================
+        # NEW: CHOP GATE (Minimum EMA Separation)
+        # ============================================================
+        # Only enforce if we are FLAT (current_net == 0). 
+        # If we are already in a trade, we might need to CLOSE, so don't block.
+        ema_sep = _f(features.get("ema_sep_pips", 0))
+        
+        # JPY pairs often need slightly higher separation due to higher nominal value
+        required_sep = MIN_EMA_SEP_PIPS
+        if "JPY" in pair: 
+            required_sep = MIN_EMA_SEP_PIPS * 1.2
+            
+        if current_net == 0 and ema_sep < required_sep:
+             db_record_execution(
+                alert_id=alert_id, action="observe", instrument=pair,
+                current_net=current_net, spread_pips=spread_pips_val,
+                status="RULE_BLOCKED_CHOP", 
+                meta=json.dumps({"ema_sep": ema_sep, "required": required_sep})
+             )
+             return {"status": "RULE_BLOCKED_CHOP", "ema_sep": ema_sep}, 200
+
+        # ============================================================
+        # NEW: SUNDAY LIQUIDITY FILTER (Fixing the XAU issue)
+        # ============================================================
+        # If it is Sunday (weekday 6) and before 22:00 UTC (5 PM EST), block XAU/USD
+        now_utc = datetime.datetime.utcnow()
+        if "XAU" in pair and now_utc.weekday() == 6 and now_utc.hour < 22:
+             db_record_execution(
+                alert_id=alert_id, action="observe", instrument=pair,
+                current_net=current_net, spread_pips=spread_pips_val,
+                status="RULE_BLOCKED_SUNDAY_OPEN", 
+                meta=json.dumps({"hour_utc": now_utc.hour})
+             )
+             return {"status": "RULE_BLOCKED_SUNDAY_OPEN"}, 200
 
         if current_net == 0 and is_overextended:
              db_record_execution(
