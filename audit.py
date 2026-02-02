@@ -255,7 +255,7 @@ def show_today_decisions():
         # Truncate to keep table clean
         reason_display = (reason_s[:85] + "..") if len(reason_s) > 85 else reason_s
 
-        print(f"{local_str:<8} | {utc_str:<8} | {pair:<8} | {action:<7} | {pnl:<9} | {status:<20} | {spread_disp:>6} | {conf_disp:>5} | {reason_display}")
+        print(f"{local_str:<8} | {utc_str:<8} | {pair:<8} | {action:<7} | {pnl:<9} | {status:<25} | {spread_disp:>6} | {conf_disp:>5} | {reason_display}")
 
     conn.close()
 
