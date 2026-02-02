@@ -32,6 +32,7 @@ GPT_MIN_CONFIDENCE = float(os.getenv("GPT_MIN_CONFIDENCE", "0.55"))
 # Safety: default disallows scaling up (1.0 => only reduce or unchanged)
 GPT_MAX_UNITS_MULT = float(os.getenv("GPT_MAX_UNITS_MULT", "1.0"))
 GPT_TIMEOUT_SECONDS = float(os.getenv("GPT_TIMEOUT_SECONDS", "12"))
+GPT_ENTRY_ADX = int(os.getenv("GPT_ENTRY_ADX", "25"))
 
 openai_client = None
 if OpenAI and OPENAI_API_KEY:
@@ -128,7 +129,7 @@ def gpt_decide_trade(context: dict) -> dict:
             "- tp_pips: Use 0 for No TP. Use null to accept default/hint. If > 0, must be >= 10.\n\n"
             "Execution Logic:\n"
             "1. Setup A (Cross): Cross detected + Momentum Confirmation + ADX/SEP filters met.\n"
-            "2. Setup B (Continuation): ADX >= 25 + EMA Sep > 2.0 + Trend Bias MUST match side (no mixed).\n"
+            f"2. Setup B (Continuation): ADX >= {GPT_ENTRY_ADX} + EMA Sep > 2.0 + Trend Bias MUST match side (no mixed).\n"
             "3. Sizing: units_mult = 1.0. Reduce to 0.5 if ADX [15-17], low separation, or weak momentum.\n\n"
             "CLOSE rules (allowed to close):\n"
             "- If Long: CLOSE if trendDown is true OR sellCross is true OR adx < 14.\n"
