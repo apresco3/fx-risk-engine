@@ -479,8 +479,7 @@ def get_account_nav_and_currency():
 
 def get_price_snapshot(instrument: str) -> Tuple[Decimal, Decimal, Decimal]:
     """
-    Returns (bid, ask, mid) using closeoutBid/closeoutAsk when present,
-    so UPL matches OANDA's UI liquidation valuation.
+    Returns (bid, ask, mid) using raw market bids/asks for execution.
     """
     r = oanda_get_pricing(instrument)
     if not r.ok:
@@ -491,8 +490,18 @@ def get_price_snapshot(instrument: str) -> Tuple[Decimal, Decimal, Decimal]:
         raise RuntimeError("No pricing data returned")
     p = prices[0]
 
-    bid_s = p.get("closeoutBid") or p["bids"][0]["price"]
-    ask_s = p.get("closeoutAsk") or p["asks"][0]["price"]
+    # --- FIX: Use raw liquidity, not margin closeout ---
+    # OANDA returns a list of buckets, [0] is the best available price.
+    if "bids" in p and p["bids"]:
+        bid_s = p["bids"][0]["price"]
+    else:
+        bid_s = p.get("closeoutBid") # Fallback only if raw missing
+
+    if "asks" in p and p["asks"]:
+        ask_s = p["asks"][0]["price"]
+    else:
+        ask_s = p.get("closeoutAsk") # Fallback only if raw missing
+    # ---------------------------------------------------
 
     bid = Decimal(str(bid_s))
     ask = Decimal(str(ask_s))
