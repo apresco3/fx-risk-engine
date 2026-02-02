@@ -128,7 +128,7 @@ def gpt_decide_trade(context: dict) -> dict:
             "- tp_pips: Use 0 for No TP. Use null to accept default/hint. If > 0, must be >= 10.\n\n"
             "Execution Logic:\n"
             "1. Setup A (Cross): Cross detected + Momentum Confirmation + ADX/SEP filters met.\n"
-            "2. Setup B (Continuation): ADX >= 22 + Trend/Slope match + Lookback consistency.\n"
+            "2. Setup B (Continuation): ADX >= 25 + EMA Sep > 2.0 + Trend Bias MUST match side (no mixed).\n"
             "3. Sizing: units_mult = 1.0. Reduce to 0.5 if ADX [15-17], low separation, or weak momentum.\n\n"
             "CLOSE rules (allowed to close):\n"
             "- If Long: CLOSE if trendDown is true OR sellCross is true OR adx < 14.\n"
@@ -222,7 +222,7 @@ MAX_TP_PIPS = int(os.getenv("MAX_TP_PIPS", str(TP_PIPS_DEFAULT)))
 MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "1"))
 
 MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))
-MIN_EMA_SEP_PIPS = float(os.getenv("MIN_EMA_SEP_PIPS", "0.9"))  # NEW: Anti-chop floor
+MIN_EMA_SEP_PIPS = float(os.getenv("MIN_EMA_SEP_PIPS", "1.5"))
 
 # ============================================================
 # NEW: Trade Degradation Exit (stall + profit-protect)
@@ -1100,7 +1100,13 @@ def webhook():
         dist_to_ema = _f(features.get("dist_to_ema_200", 0))
         adx = _f(features.get("adx", 0))
         is_overextended = False
-        if abs(dist_to_ema) > 40 and adx < 20:
+        # Update inside the observe/webhook route
+        is_overextended = False
+        # If price is > 50 pips from EMA, we are risky regardless of trend strength
+        if abs(dist_to_ema) > 50: 
+             is_overextended = True
+        # Keep the chop-overextension check too if you like
+        elif abs(dist_to_ema) > 40 and adx < 20:
              is_overextended = True
         
         # --- Robust Trend Bias ---

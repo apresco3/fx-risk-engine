@@ -41,6 +41,34 @@ def _fmt_num(x, fmt=":.2f"):
         return str(x)
 
 
+def get_pnl(action: str, status: str, oanda_response: str) -> str:
+    """
+    Extracts Realized P/L from the OANDA JSON response if available.
+    Returns string representation (e.g. "-0.45" or "-")
+    """
+    if action.lower() != "close" or status != "OK" or not oanda_response:
+        return "-"
+
+    try:
+        data = json.loads(oanda_response)
+        # OANDA close responses usually contain fill transaction details
+        fill = (
+            data.get("orderFillTransaction") or 
+            data.get("longOrderFillTransaction") or 
+            data.get("shortOrderFillTransaction")
+        )
+        
+        if fill:
+            val = float(fill.get("pl", 0.0))
+            # Format: explicit plus sign for profit, red/negative handling handled by caller context if needed
+            return f"{val:+.2f}"
+            
+    except Exception:
+        pass
+    
+    return "-"
+
+
 def _format_degradation_exit(meta: dict) -> str:
     mode = str(meta.get("mode", "UNKNOWN"))
     held = meta.get("held_min", None)
@@ -68,7 +96,7 @@ def _format_degradation_exit(meta: dict) -> str:
 
 
 def derive_reason(status: str, spread_pips, meta: dict) -> str:
-    # --- NEW: Degradation exit rule ---
+    # --- Degradation exit rule ---
     if isinstance(meta, dict) and meta.get("rule") == "DEGRADATION_EXIT":
         return _format_degradation_exit(meta)
 
@@ -127,7 +155,6 @@ def derive_reason(status: str, spread_pips, meta: dict) -> str:
         return "Failed to fetch open positions/state."
 
     if s == "SAFETY_BLOCKED_FLIP":
-        # Sometimes meta is empty; sometimes it includes a reason string.
         if isinstance(meta, dict) and "reason" in meta:
             return str(meta["reason"])
         return "Safety Block: Cannot flip Net Long/Short instantly."
@@ -148,22 +175,13 @@ def derive_reason(status: str, spread_pips, meta: dict) -> str:
 
 
 def extract_gpt_fields(meta: dict):
-    """
-    Returns (confidence, reason) if present.
-
-    OPEN meta often: {"gpt": {...}, "features": {...}}
-    HOLD/CLOSE meta often flat: {"confidence":..., "reason":...}
-    RULE close meta (degradation) also flat: {"rule":"DEGRADATION_EXIT", ...}
-    """
     if not isinstance(meta, dict):
         return None, None
 
-    # OPEN meta often: {"gpt": {...}, "features": {...}}
     if "gpt" in meta and isinstance(meta["gpt"], dict):
         g = meta["gpt"]
         return g.get("confidence"), g.get("reason")
 
-    # Flat meta (HOLD/CLOSE/rules)
     if "reason" in meta or "confidence" in meta:
         return meta.get("confidence"), meta.get("reason")
 
@@ -179,7 +197,7 @@ def show_today_decisions():
 
     cur.execute(
         """
-        SELECT ts, instrument, action, status, spread_pips, meta
+        SELECT ts, instrument, action, status, spread_pips, meta, oanda_response
         FROM executions
         WHERE ts >= ?
         ORDER BY ts DESC
@@ -189,8 +207,11 @@ def show_today_decisions():
 
     day_label = "UTC" if USE_UTC_DAY else "LOCAL"
     print(f"\n########## AUDIT — TODAY ({day_label}) ##########\n")
-    print(f"{'LOCAL':<8} | {'UTC':<8} | {'PAIR':<8} | {'ACTION':<7} | {'STATUS':<26} | {'SPRD':>6} | {'CONF':>5} | REASON")
-    print("-" * 160)
+    
+    # Adjusted column headers to fit P/L
+    header = f"{'LOCAL':<8} | {'UTC':<8} | {'PAIR':<8} | {'ACTION':<7} | {'P/L':<9} | {'STATUS':<20} | {'SPRD':>6} | {'CONF':>5} | REASON"
+    print(header)
+    print("-" * len(header))
 
     rows = cur.fetchall()
     if not rows:
@@ -210,28 +231,29 @@ def show_today_decisions():
         pair = row["instrument"] or "N/A"
         action = (row["action"] or "N/A").upper()
         status = row["status"] or "N/A"
+        
+        # New P/L Extraction
+        pnl = get_pnl(action, status, row["oanda_response"])
 
         spread = row["spread_pips"]
         spread_disp = f"{spread:.1f}" if isinstance(spread, (int, float)) else "N/A"
 
         meta = _safe_json_loads(row["meta"]) if row["meta"] else {}
-
         conf, reason = extract_gpt_fields(meta)
 
-        # If no direct reason, derive from status/meta (also handles degradation rule)
         if not reason:
             reason = derive_reason(status, spread, meta)
         else:
-            # If it's a degradation exit, prefer the structured formatter even if reason exists
             if isinstance(meta, dict) and meta.get("rule") == "DEGRADATION_EXIT":
                 reason = _format_degradation_exit(meta)
 
         conf_disp = f"{float(conf):.2f}" if conf is not None else "N/A"
-
         reason_s = str(reason)
-        reason_display = (reason_s[:100] + "..") if len(reason_s) > 100 else reason_s
+        
+        # Truncate reason slightly more to fit the new column
+        reason_display = (reason_s[:90] + "..") if len(reason_s) > 90 else reason_s
 
-        print(f"{local_str:<8} | {utc_str:<8} | {pair:<8} | {action:<7} | {status:<26} | {spread_disp:>6} | {conf_disp:>5} | {reason_display}")
+        print(f"{local_str:<8} | {utc_str:<8} | {pair:<8} | {action:<7} | {pnl:<9} | {status:<20} | {spread_disp:>6} | {conf_disp:>5} | {reason_display}")
 
     conn.close()
 
