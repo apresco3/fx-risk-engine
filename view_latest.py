@@ -4,6 +4,7 @@ import os
 import textwrap
 import datetime
 import time
+from decimal import Decimal
 
 DB_PATH = "bot.db"
 
@@ -22,29 +23,7 @@ def _fmt_num(x, fmt=":.2f"):
         return str(x)
 
 
-def _fmt_signed(x, fmt=":.1f"):
-    try:
-        return f"{float(x):{fmt}}"
-    except Exception:
-        return str(x)
-
-
 def _format_degradation_exit(meta: dict) -> str:
-    """
-    meta from bot.py degradation exit:
-      {
-        "action":"CLOSE",
-        "confidence":1.0,
-        "reason":"RULE_DEGRADATION_EXIT: ...",
-        "rule":"DEGRADATION_EXIT",
-        "mode":"STALL"|"PROFIT_PROTECT",
-        "held_min": float,
-        "pips_now": float,
-        "adx": float,
-        "ema_sep_pips": float,
-        "trend_bias": "mixed"|...
-      }
-    """
     mode = str(meta.get("mode", "UNKNOWN"))
     held = meta.get("held_min", None)
     pips = meta.get("pips_now", meta.get("pips", None))
@@ -56,7 +35,6 @@ def _format_degradation_exit(meta: dict) -> str:
     if held is not None:
         parts.append(f"held {_fmt_num(held, ':.1f')}m")
     if pips is not None:
-        # show sign
         try:
             parts.append(f"pips {float(pips):+.1f}")
         except Exception:
@@ -72,32 +50,21 @@ def _format_degradation_exit(meta: dict) -> str:
 
 
 def format_reason(data, meta):
-    """
-    Prefer:
-      1) Explicit rule-based meta (DEGRADATION_EXIT)
-      2) GPT reason/confidence when present
-      3) Derived human reason from status/spread/meta
-    """
     gpt_reason = None
     confidence = None
 
-    # --- NEW: Rule-based close (degradation exit) ---
     if isinstance(meta, dict) and meta.get("rule") == "DEGRADATION_EXIT":
         gpt_reason = _format_degradation_exit(meta)
         confidence = meta.get("confidence", 1.0)
         return gpt_reason, confidence
 
-    # OPEN meta often nested: {"gpt": {...}, "features": {...}}
     if isinstance(meta, dict) and "gpt" in meta and isinstance(meta["gpt"], dict):
         gpt_reason = meta["gpt"].get("reason")
         confidence = meta["gpt"].get("confidence")
-
-    # HOLD/CLOSE meta often flat
     elif isinstance(meta, dict) and ("reason" in meta or "confidence" in meta):
         gpt_reason = meta.get("reason")
         confidence = meta.get("confidence")
 
-    # If GPT did not provide a reason, derive from status
     if not gpt_reason:
         status = str(data.get("status", "")).upper()
         spread = data.get("spread_pips", None)
@@ -114,7 +81,6 @@ def format_reason(data, meta):
         elif status == "RULE_BLOCKED_SPREAD_UNKNOWN":
             gpt_reason = "Spread unknown: pricing fetch failed."
 
-        # --- CHOP GATE ---
         elif status == "RULE_BLOCKED_CHOP":
             if isinstance(meta, dict):
                 sep = meta.get("ema_sep")
@@ -127,7 +93,6 @@ def format_reason(data, meta):
             else:
                 gpt_reason = "Blocked by Chop Gate (low momentum)."
 
-        # --- SUNDAY FILTER ---
         elif status == "RULE_BLOCKED_SUNDAY_OPEN":
             if isinstance(meta, dict):
                 h = meta.get("hour_utc", "?")
@@ -183,6 +148,22 @@ def _fmt_ts_both(ts: int) -> tuple[str, str]:
     return dt_local.strftime("%Y-%m-%d %H:%M:%S"), dt_utc.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def pip_size_for(instrument: str) -> Decimal:
+    # Must mirror bot.py (after fix)
+    if "XAU" in instrument:
+        return Decimal("0.1")
+    if instrument.endswith("_JPY"):
+        return Decimal("0.01")
+    return Decimal("0.0001")
+
+
+def pips_from_entry(instrument: str, side: str, entry: Decimal, mark: Decimal) -> float:
+    pip = pip_size_for(instrument)
+    if side.lower() == "buy":
+        return float((mark - entry) / pip)
+    return float((entry - mark) / pip)
+
+
 def print_execution(title, data, meta):
     gpt_reason, confidence = format_reason(data, meta)
 
@@ -211,7 +192,6 @@ def main():
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # --- SECTION 1: SYSTEM STATUS (latest per instrument in last 24h) ---
     cutoff_ts = int(time.time() - 86400)
     query_logs = """
         SELECT e.* FROM executions e
@@ -226,7 +206,6 @@ def main():
     cur.execute(query_logs, (cutoff_ts,))
     recent_rows = cur.fetchall()
 
-    # --- SECTION 2: ACTIVE PORTFOLIO ---
     query_portfolio = "SELECT * FROM trade_state WHERE is_open = 1 ORDER BY instrument ASC"
     cur.execute(query_portfolio)
     active_trades = cur.fetchall()
@@ -249,6 +228,8 @@ def main():
     print(" 💰 ACTIVE PORTFOLIO (Open Trades Only)")
     print("#" * 60)
 
+    acct_ccy = os.getenv("ACCOUNT_CURRENCY", "USD")
+
     if not active_trades:
         print("\n[FLAT] No open trades currently.")
     else:
@@ -263,12 +244,28 @@ def main():
             else:
                 duration_str = "N/A"
 
+            entry = None
+            mark = None
+            pips = None
+            try:
+                if t.get("entry_price") is not None:
+                    entry = Decimal(str(t["entry_price"]))
+                if t.get("last_mark_price") is not None:
+                    mark = Decimal(str(t["last_mark_price"]))
+                if entry is not None and mark is not None and t.get("side"):
+                    pips = pips_from_entry(t["instrument"], str(t["side"]), entry, mark)
+            except Exception:
+                pips = None
+
             print(f"\n>>> OPEN POSITION: {t['instrument']}")
             print(f"    SIDE:        {str(t['side']).upper()}")
             print(f"    UNITS:       {t['units']}")
             print(f"    ENTRY PRICE: {t['entry_price']}")
+            print(f"    MARK PRICE:  {t.get('last_mark_price', 'N/A')}")
+            if pips is not None:
+                print(f"    PIPS (Est):  {pips:+.1f}")
             print(f"    DURATION:    {duration_str}")
-            print(f"    UPL (Est):   {t.get('unrealized_pl_home', '0.00')} {os.getenv('ACCOUNT_CURRENCY', 'USD')}")
+            print(f"    UPL (Est):   {t.get('unrealized_pl_home', '0.00')} {acct_ccy}")
             print("-" * 40)
 
 

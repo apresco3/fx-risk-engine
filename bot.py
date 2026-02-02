@@ -440,14 +440,21 @@ def seen_before(alert_id: str) -> bool:
 # OANDA helpers
 # ============================================================
 def pip_size_for(instrument: str) -> Decimal:
+    # FIX: XAU pips are typically treated as $0.10 increments (10 ticks of $0.01)
     if "XAU" in instrument:
-        return Decimal("0.01")
+        return Decimal("0.1")
     if instrument.endswith("_JPY"):
         return Decimal("0.01")
     return Decimal("0.0001")
 
 def fmt_price_decimal(x: Decimal, instrument: str) -> str:
-    places = Decimal("0.001") if instrument.endswith("_JPY") else Decimal("0.00001")
+    # FIX: XAU distances should be formatted to 0.01 (2dp)
+    if "XAU" in instrument:
+        places = Decimal("0.01")
+    elif instrument.endswith("_JPY"):
+        places = Decimal("0.001")
+    else:
+        places = Decimal("0.00001")
     return str(x.quantize(places, rounding=ROUND_DOWN))
 
 def oanda_get_open_positions():
@@ -470,7 +477,11 @@ def get_account_nav_and_currency():
     currency = str(acct.get("currency", "USD")).upper()
     return nav, currency
 
-def get_spread_pips(instrument: str) -> float:
+def get_price_snapshot(instrument: str) -> Tuple[Decimal, Decimal, Decimal]:
+    """
+    Returns (bid, ask, mid) using closeoutBid/closeoutAsk when present,
+    so UPL matches OANDA's UI liquidation valuation.
+    """
     r = oanda_get_pricing(instrument)
     if not r.ok:
         raise RuntimeError(f"Failed to fetch pricing: HTTP {r.status_code} {r.text}")
@@ -479,24 +490,24 @@ def get_spread_pips(instrument: str) -> float:
     if not prices:
         raise RuntimeError("No pricing data returned")
     p = prices[0]
-    bid = Decimal(p["bids"][0]["price"])
-    ask = Decimal(p["asks"][0]["price"])
+
+    bid_s = p.get("closeoutBid") or p["bids"][0]["price"]
+    ask_s = p.get("closeoutAsk") or p["asks"][0]["price"]
+
+    bid = Decimal(str(bid_s))
+    ask = Decimal(str(ask_s))
+    mid = (bid + ask) / Decimal(2)
+    return bid, ask, mid
+
+def get_spread_pips(instrument: str) -> float:
+    bid, ask, _ = get_price_snapshot(instrument)
     spread = ask - bid
     pip = pip_size_for(instrument)
     return float(spread / pip)
 
 def get_mid_price(instrument: str) -> Decimal:
-    r = oanda_get_pricing(instrument)
-    if not r.ok:
-        raise RuntimeError(f"Failed to fetch pricing: HTTP {r.status_code} {r.text}")
-    data = r.json()
-    prices = data.get("prices", [])
-    if not prices:
-        raise RuntimeError("No pricing data returned")
-    p = prices[0]
-    bid = Decimal(p["bids"][0]["price"])
-    ask = Decimal(p["asks"][0]["price"])
-    return (bid + ask) / Decimal(2)
+    _, _, mid = get_price_snapshot(instrument)
+    return mid
 
 def get_net_units_for_instrument(instrument: str) -> int:
     r = oanda_get_open_positions()
@@ -609,8 +620,10 @@ def quote_to_home_mid(quote_ccy: str, home_ccy: str) -> Optional[Decimal]:
         r = oanda_get_pricing(quote_home)
         if r.ok and r.json().get("prices"):
             p = r.json()["prices"][0]
-            bid = Decimal(p["bids"][0]["price"])
-            ask = Decimal(p["asks"][0]["price"])
+            bid_s = p.get("closeoutBid") or p["bids"][0]["price"]
+            ask_s = p.get("closeoutAsk") or p["asks"][0]["price"]
+            bid = Decimal(str(bid_s))
+            ask = Decimal(str(ask_s))
             return (bid + ask) / Decimal(2)
     except Exception:
         pass
@@ -618,8 +631,10 @@ def quote_to_home_mid(quote_ccy: str, home_ccy: str) -> Optional[Decimal]:
     if not r2.ok or not r2.json().get("prices"):
         return None
     p2 = r2.json()["prices"][0]
-    bid2 = Decimal(p2["bids"][0]["price"])
-    ask2 = Decimal(p2["asks"][0]["price"])
+    bid2_s = p2.get("closeoutBid") or p2["bids"][0]["price"]
+    ask2_s = p2.get("closeoutAsk") or p2["asks"][0]["price"]
+    bid2 = Decimal(str(bid2_s))
+    ask2 = Decimal(str(ask2_s))
     mid2 = (bid2 + ask2) / Decimal(2)   # 1 home = mid2 quote
     return Decimal(1) / mid2            # 1 quote = 1/mid2 home
 
@@ -656,7 +671,6 @@ def loss_per_unit_home(*, instrument: str, sl_pips: int, account_ccy: str) -> De
         return sl_dist_quote
     conv = quote_to_home_mid(quote, account_ccy)
     if conv is None:
-        # We will catch this upstream now
         raise RuntimeError(
             f"Cannot risk-size safely: quote={quote} != account_ccy={account_ccy}. "
             f"Market conversion failed."
@@ -988,7 +1002,6 @@ def webhook():
     key = request.args.get("key", "")
     if key != WEBHOOK_KEY:
         log("AUTH BLOCKED")
-        # AUDIT FIX: No DB write, just file log
         return {"status": "UNAUTHORIZED"}, 401
 
     if not TRADING_ENABLED:
@@ -1032,7 +1045,11 @@ def webhook():
         try:
             r = close_position(pair)
             log(f"CLOSE | alert_id={alert_id} | {pair} | HTTP {r.status_code}")
-            upsert_trade_state(instrument=pair, is_open=False, side=None, units=None, entry_price=None, entry_time_ms=None, last_mark_price=None, unrealized_pl_home=None, realized_pl_home=None)
+            upsert_trade_state(
+                instrument=pair, is_open=False, side=None, units=None,
+                entry_price=None, entry_time_ms=None, last_mark_price=None,
+                unrealized_pl_home=None, realized_pl_home=None
+            )
             
             status = "OK" if r.ok else "OANDA_ERROR"
             db_record_execution(
@@ -1088,42 +1105,39 @@ def webhook():
         nav = None
         acct_ccy = None
         
-        # Only fetch account summary if we are already in a trade (needed for UPL)
-        # If we are FLAT (current_net == 0), we skip this heavy call.
         if current_net != 0:
-             try:
-                 nav, acct_ccy = get_account_nav_and_currency()
-             except Exception:
-                 pass # Don't crash here; we can still trade without live UPL
+            try:
+                nav, acct_ccy = get_account_nav_and_currency()
+            except Exception:
+                pass
 
         # --- PRE-COMPUTE FLAGS ---
         dist_to_ema = _f(features.get("dist_to_ema_200", 0))
         adx = _f(features.get("adx", 0))
         is_overextended = False
-        # Update inside the observe/webhook route
-        is_overextended = False
-        # If price is > 50 pips from EMA, we are risky regardless of trend strength
-        if abs(dist_to_ema) > 50: 
-             is_overextended = True
-        # Keep the chop-overextension check too if you like
+
+        if abs(dist_to_ema) > 50:
+            is_overextended = True
         elif abs(dist_to_ema) > 40 and adx < 20:
-             is_overextended = True
+            is_overextended = True
         
         # --- Robust Trend Bias ---
         lookback = features.get("lookback", [])
         trend_bias = "mixed"
         if lookback and len(lookback) >= 5:
-             recent = lookback[:5] 
-             up_count = sum(1 for c in recent if _f(c.get("close")) > _f(c.get("open")))
-             if up_count >= 4: trend_bias = "bullish"
-             elif up_count <= 1: trend_bias = "bearish"
+            recent = lookback[:5]
+            up_count = sum(1 for c in recent if _f(c.get("close")) > _f(c.get("open")))
+            if up_count >= 4:
+                trend_bias = "bullish"
+            elif up_count <= 1:
+                trend_bias = "bearish"
         
         analysis = {
-             "is_overextended": is_overextended,
-             "trend_bias": trend_bias
+            "is_overextended": is_overextended,
+            "trend_bias": trend_bias
         }
 
-        # --- FETCH PRICING (Always fetch since we always want GPT) ---
+        # --- FETCH PRICING (spread) ---
         spread_pips_val = None
         if MAX_SPREAD_PIPS > 0:
             try:
@@ -1131,7 +1145,6 @@ def webhook():
             except Exception:
                 spread_pips_val = None
             
-            # --- Unknown Spread Gate ---
             if spread_pips_val is None:
                 db_record_execution(
                     alert_id=alert_id, action="observe", instrument=pair,
@@ -1143,69 +1156,73 @@ def webhook():
         # --- PRE-GATING: SPREAD & OVEREXTENSION ---
         dynamic_spread_limit = MAX_SPREAD_PIPS
         if "XAU" in pair:
-             dynamic_spread_limit = 60.0
+            dynamic_spread_limit = 60.0
 
         if spread_pips_val is not None and spread_pips_val > dynamic_spread_limit:
-             db_record_execution(
+            db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
                 current_net=current_net, spread_pips=spread_pips_val,
                 status="RULE_BLOCKED_SPREAD", meta=json.dumps({"limit": dynamic_spread_limit})
-             )
-             return {"status": "RULE_BLOCKED_SPREAD"}, 200
+            )
+            return {"status": "RULE_BLOCKED_SPREAD"}, 200
         
         # ============================================================
-        # NEW: CHOP GATE (Minimum EMA Separation)
+        # CHOP GATE (Minimum EMA Separation)
         # ============================================================
-        # Only enforce if we are FLAT (current_net == 0). 
-        # If we are already in a trade, we might need to CLOSE, so don't block.
         ema_sep = _f(features.get("ema_sep_pips", 0))
         
-        # JPY pairs often need slightly higher separation due to higher nominal value
         required_sep = MIN_EMA_SEP_PIPS
-        if "JPY" in pair: 
+        if "JPY" in pair:
             required_sep = MIN_EMA_SEP_PIPS * 1.2
             
         if current_net == 0 and ema_sep < required_sep:
-             db_record_execution(
+            db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
                 current_net=current_net, spread_pips=spread_pips_val,
-                status="RULE_BLOCKED_CHOP", 
+                status="RULE_BLOCKED_CHOP",
                 meta=json.dumps({"ema_sep": ema_sep, "required": required_sep})
-             )
-             return {"status": "RULE_BLOCKED_CHOP", "ema_sep": ema_sep}, 200
+            )
+            return {"status": "RULE_BLOCKED_CHOP", "ema_sep": ema_sep}, 200
 
         # ============================================================
-        # NEW: SUNDAY LIQUIDITY FILTER (Fixing the XAU issue)
+        # SUNDAY LIQUIDITY FILTER (XAU)
         # ============================================================
-        # If it is Sunday (weekday 6) and before 22:00 UTC (5 PM EST), block XAU/USD
         now_utc = datetime.datetime.utcnow()
         if "XAU" in pair and now_utc.weekday() == 6 and now_utc.hour < 22:
-             db_record_execution(
+            db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
                 current_net=current_net, spread_pips=spread_pips_val,
-                status="RULE_BLOCKED_SUNDAY_OPEN", 
+                status="RULE_BLOCKED_SUNDAY_OPEN",
                 meta=json.dumps({"hour_utc": now_utc.hour})
-             )
-             return {"status": "RULE_BLOCKED_SUNDAY_OPEN"}, 200
+            )
+            return {"status": "RULE_BLOCKED_SUNDAY_OPEN"}, 200
 
         if current_net == 0 and is_overextended:
-             db_record_execution(
+            db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
                 current_net=current_net, spread_pips=spread_pips_val,
                 status="RULE_BLOCKED_OVEREXTENDED", meta=json.dumps(analysis)
-             )
-             return {"status": "RULE_BLOCKED_OVEREXTENDED"}, 200
+            )
+            return {"status": "RULE_BLOCKED_OVEREXTENDED"}, 200
         
         # --- Update Trade State (UPL) ---
-        # We only update UPL if we have acct_ccy (which we fetched only if current_net != 0)
         ts = get_trade_state(pair)
         if ts and int(ts.get("is_open", 0)) == 1 and acct_ccy:
             try:
-                mark = get_mid_price(pair)
+                bid, ask, mid = get_price_snapshot(pair)
+
                 entry = Decimal(str(ts["entry_price"]))
-                side_ts = str(ts["side"])
+                side_ts = str(ts["side"]).lower()
                 units_ts = int(ts["units"])
+
+                # FIX: mark at closeout side so UPL matches OANDA UI
+                if side_ts == "buy":
+                    mark = bid
+                else:
+                    mark = ask
+
                 upl = compute_unrealized_pl_home(pair, side_ts, units_ts, entry, mark, acct_ccy)
+
                 upsert_trade_state(
                     instrument=pair, is_open=True, side=side_ts, units=units_ts,
                     entry_price=entry, entry_time_ms=int(ts.get("entry_time_ms") or (time.time()*1000)),
@@ -1216,7 +1233,7 @@ def webhook():
                 pass
 
         # ============================================================
-        # NEW: TRADE DEGRADATION EXIT (only when IN a trade)
+        # TRADE DEGRADATION EXIT (only when IN a trade)
         # ============================================================
         if DEGRADE_EXIT_ENABLED and current_net != 0:
             ts2 = get_trade_state(pair)
@@ -1227,39 +1244,35 @@ def webhook():
                     now_ms = int(time.time() * 1000)
                     held_min = (now_ms - entry_time_ms) / 60000.0
 
-                    # Determine side from DB; fall back to net sign
                     side_ts = str(ts2.get("side") or ("buy" if current_net > 0 else "sell")).lower()
                     if side_ts not in ("buy", "sell"):
                         side_ts = "buy" if current_net > 0 else "sell"
 
-                    # Current market state
-                    mark = get_mid_price(pair)
+                    bid, ask, mid = get_price_snapshot(pair)
+
+                    # FIX: use closeout mark for pips/profit logic too
+                    mark = bid if side_ts == "buy" else ask
+
                     ema_sep_now = _f(features.get("ema_sep_pips", 0))
                     adx_now = _f(features.get("adx", 0))
                     trend_bias_now = analysis.get("trend_bias", "mixed")
 
-                    # JPY pairs can use a slightly higher EMA separation threshold
                     degrade_sep = DEGRADE_EMA_SEP_PIPS * (1.2 if "JPY" in pair else 1.0)
 
-                    # "Chop" / degradation condition while IN a position
                     is_degraded = (
                         adx_now <= DEGRADE_ADX_MAX and
                         ema_sep_now <= degrade_sep and
                         trend_bias_now == "mixed"
                     )
 
-                    # PnL in pips from entry
                     pips_now = pips_from_entry(pair, side_ts, entry, mark)
 
-                    # Two exits:
-                    # 1) Stall: long time + basically flat + degraded
                     stall_exit = (
                         held_min >= DEGRADE_MIN_MINUTES and
                         abs(pips_now) <= DEGRADE_STALL_PIPS and
                         is_degraded
                     )
 
-                    # 2) Profit-protect: decent winner + degraded
                     profit_protect_exit = (
                         held_min >= DEGRADE_PROFIT_PROTECT_MIN_MINUTES and
                         pips_now >= DEGRADE_PROFIT_PROTECT_PIPS and
@@ -1320,9 +1333,7 @@ def webhook():
                         return {"status": status, "action": "close", "reason": reason}, (200 if r.ok else 502)
 
                 except Exception as e:
-                    # Don't crash the bot if degradation logic fails
                     log(f"DEGRADE_EXIT_FAIL | {pair} | {repr(e)}")
-
 
         gpt_ctx = {
             "pair": pair,
@@ -1363,11 +1374,19 @@ def webhook():
         if gpt_decision["action"] == "CLOSE":
             try:
                 r = close_position(pair)
-                upsert_trade_state(instrument=pair, is_open=False, side=None, units=None, entry_price=None, entry_time_ms=None, last_mark_price=None, unrealized_pl_home=None, realized_pl_home=None)
+                upsert_trade_state(
+                    instrument=pair, is_open=False, side=None, units=None,
+                    entry_price=None, entry_time_ms=None, last_mark_price=None,
+                    unrealized_pl_home=None, realized_pl_home=None
+                )
                 
                 status = "OK" if r.ok else "OANDA_ERROR"
                 db_record_execution(
-                    alert_id=alert_id, action="close", instrument=pair, side=None, units=None, sl_pips=None, tp_pips=None, current_net=current_net, projected_net=None, spread_pips=spread_pips_val, oanda_http=r.status_code, status=status, oanda_response=r.text, meta=json.dumps(gpt_decision)
+                    alert_id=alert_id, action="close", instrument=pair, side=None,
+                    units=None, sl_pips=None, tp_pips=None, current_net=current_net,
+                    projected_net=None, spread_pips=spread_pips_val,
+                    oanda_http=r.status_code, status=status, oanda_response=r.text,
+                    meta=json.dumps(gpt_decision)
                 )
                 return {"status": status, "action": "close"}, (200 if r.ok else 502)
             except Exception as e:
@@ -1375,20 +1394,17 @@ def webhook():
                 return {"status": "ERROR", "error": str(e)}, 502
 
         if gpt_decision["action"] == "OPEN":
-            # Cooldown check
             cooldown_min = int(os.getenv("PYRAMID_COOLDOWN_MINUTES", "15"))
             if current_net != 0 and not check_cooldown(pair, cooldown_min):
                 log(f"COOLDOWN_ACTIVE | {pair}")
                 db_record_execution(alert_id=alert_id, action="observe", instrument=pair, status="COOLDOWN_ACTIVE", meta=json.dumps(gpt_decision))
                 return {"status": "COOLDOWN_ACTIVE"}, 200
             
-            # Validate Side
             side = gpt_decision["side"]
             if side not in ("buy", "sell"):
-                 db_record_execution(alert_id=alert_id, action="observe", instrument=pair, status="GPT_INVALID_SIDE", meta=json.dumps(gpt_decision))
-                 return {"status": "GPT_INVALID_SIDE"}, 200
+                db_record_execution(alert_id=alert_id, action="observe", instrument=pair, status="GPT_INVALID_SIDE", meta=json.dumps(gpt_decision))
+                return {"status": "GPT_INVALID_SIDE"}, 200
 
-            # --- P0 FIX: Careful with 0 vs None Fallback ---
             sl_pips = gpt_decision["sl_pips"] if gpt_decision["sl_pips"] is not None else hint_sl
             tp_pips = gpt_decision["tp_pips"] if gpt_decision["tp_pips"] is not None else hint_tp
             
@@ -1397,7 +1413,6 @@ def webhook():
 
             meta = {"gpt": gpt_decision, "features": features}
             
-            # --- OPTIMIZATION STEP 3: Late-Load NAV if needed for Opening ---
             if nav is None:
                 try:
                     nav, acct_ccy = get_account_nav_and_currency()

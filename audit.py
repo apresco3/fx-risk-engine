@@ -96,7 +96,7 @@ def _format_degradation_exit(meta: dict) -> str:
 
 
 def derive_reason(status: str, spread_pips, meta: dict) -> str:
-    # --- Degradation exit rule ---
+    # --- NEW: Degradation exit rule ---
     if isinstance(meta, dict) and meta.get("rule") == "DEGRADATION_EXIT":
         return _format_degradation_exit(meta)
 
@@ -175,6 +175,9 @@ def derive_reason(status: str, spread_pips, meta: dict) -> str:
 
 
 def extract_gpt_fields(meta: dict):
+    """
+    Returns (confidence, reason) if present.
+    """
     if not isinstance(meta, dict):
         return None, None
 
@@ -195,6 +198,7 @@ def show_today_decisions():
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
+    # --- FIXED: Added 'FROM executions' which was missing in your paste ---
     cur.execute(
         """
         SELECT ts, instrument, action, status, spread_pips, meta, oanda_response
@@ -207,11 +211,9 @@ def show_today_decisions():
 
     day_label = "UTC" if USE_UTC_DAY else "LOCAL"
     print(f"\n########## AUDIT — TODAY ({day_label}) ##########\n")
-    
-    # Adjusted column headers to fit P/L
-    header = f"{'LOCAL':<8} | {'UTC':<8} | {'PAIR':<8} | {'ACTION':<7} | {'P/L':<9} | {'STATUS':<20} | {'SPRD':>6} | {'CONF':>5} | REASON"
-    print(header)
-    print("-" * len(header))
+    # Adjusted formatting to accommodate P/L column
+    print(f"{'LOCAL':<8} | {'UTC':<8} | {'PAIR':<8} | {'ACTION':<7} | {'P/L':<9} | {'STATUS':<20} | {'SPRD':>6} | {'CONF':>5} | REASON")
+    print("-" * 155)
 
     rows = cur.fetchall()
     if not rows:
@@ -232,13 +234,13 @@ def show_today_decisions():
         action = (row["action"] or "N/A").upper()
         status = row["status"] or "N/A"
         
-        # New P/L Extraction
         pnl = get_pnl(action, status, row["oanda_response"])
 
         spread = row["spread_pips"]
         spread_disp = f"{spread:.1f}" if isinstance(spread, (int, float)) else "N/A"
 
         meta = _safe_json_loads(row["meta"]) if row["meta"] else {}
+
         conf, reason = extract_gpt_fields(meta)
 
         if not reason:
@@ -248,10 +250,10 @@ def show_today_decisions():
                 reason = _format_degradation_exit(meta)
 
         conf_disp = f"{float(conf):.2f}" if conf is not None else "N/A"
+
         reason_s = str(reason)
-        
-        # Truncate reason slightly more to fit the new column
-        reason_display = (reason_s[:90] + "..") if len(reason_s) > 90 else reason_s
+        # Truncate to keep table clean
+        reason_display = (reason_s[:85] + "..") if len(reason_s) > 85 else reason_s
 
         print(f"{local_str:<8} | {utc_str:<8} | {pair:<8} | {action:<7} | {pnl:<9} | {status:<20} | {spread_disp:>6} | {conf_disp:>5} | {reason_display}")
 
