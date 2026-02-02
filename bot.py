@@ -222,6 +222,7 @@ MAX_TP_PIPS = int(os.getenv("MAX_TP_PIPS", str(TP_PIPS_DEFAULT)))
 MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "1"))
 
 MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))
+MAX_SPREAD_PIPS_XAU = float(os.getenv("MAX_SPREAD_PIPS_XAU", "60.0"))
 MIN_EMA_SEP_PIPS = float(os.getenv("MIN_EMA_SEP_PIPS", "1.5"))
 
 # ============================================================
@@ -821,7 +822,7 @@ def execute_open_trade(
     if MAX_SPREAD_PIPS > 0:
         current_max_spread = MAX_SPREAD_PIPS
         if "XAU" in pair:
-            current_max_spread = 60.0
+            current_max_spread = MAX_SPREAD_PIPS_XAU
         
         if spread_pips_val is None:
             db_record_execution(
@@ -1165,7 +1166,7 @@ def webhook():
         # --- PRE-GATING: SPREAD & OVEREXTENSION ---
         dynamic_spread_limit = MAX_SPREAD_PIPS
         if "XAU" in pair:
-            dynamic_spread_limit = 60.0
+            dynamic_spread_limit = MAX_SPREAD_PIPS_XAU
 
         if spread_pips_val is not None and spread_pips_val > dynamic_spread_limit:
             db_record_execution(
