@@ -2,7 +2,7 @@
 // © ashtpres
 
 //@version=6
-indicator("Bot alerts (SMART TRIGGER) + lookback + key levels", overlay=true)
+indicator("Bot alerts (EVERY CANDLE) + lookback + key levels", overlay=true)
 
 // ====== INPUTS ======
 pair_input  = input.string("USD_JPY", "OANDA Pair", confirm=true)
@@ -78,20 +78,15 @@ price_change_3_bars_pips = (close - close[3]) / pipSize
 // ====== READINESS GUARD ======
 ready = (bar_index >= ema200Len) and (bar_index >= lookback_n) and not na(ema200) and not na(adx) and not na(rsi)
 
-// ====== SMART TRIGGER LOGIC (event-based) ======
-// 1) Regime change (trend starting)
+// ====== SMART TRIGGER LOGIC (Kept for payload, but NOT for gating) ======
 isTrendStart = (adx > 20) and (adx[1] <= 20)
-
-// 2) Overextension: trigger only on ENTER/EXIT (not every bar)
 overext_thresh = str.contains(pair_input, "XAU") ? overext_xau_pips : overext_fx_pips
 overext_now    = math.abs(dist_to_ema_200) > overext_thresh
 overext_enter  = overext_now and not overext_now[1]
 overext_exit   = (not overext_now) and overext_now[1]
-
-// 3) Trend flipped (useful for closes)
 trendFlipped = (trendUp and not trendUp[1]) or (trendDown and not trendDown[1])
 
-// Combine: Only fire if something interesting happened THIS BAR
+// We keep this to show yellow lines on the chart, but we don't use it to stop the alert
 shouldTrigger = buyCross or sellCross or isTrendStart or trendFlipped or overext_enter or overext_exit
 
 // ====== LOOKBACK JSON GENERATOR ======
@@ -117,12 +112,12 @@ get_lookback_json(int n) =>
     s
 
 // ====== MAIN ALERT JSON ======
+// MODIFIED: Removed 'and shouldTrigger'. Now fires on every bar close if ready.
 can_fire = (
     ready and
     (sl_pips <= max_sl_pips) and
     (tp_pips <= max_tp_pips) and
-    (fire_on_close ? barstate.isconfirmed : true) and
-    shouldTrigger
+    (fire_on_close ? barstate.isconfirmed : true)
 )
 
 if can_fire

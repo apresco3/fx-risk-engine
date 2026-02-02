@@ -122,6 +122,7 @@ def gpt_decide_trade(context: dict) -> dict:
             "- analysis.trend_bias: 'bullish', 'bearish', or 'mixed' (based on last 5 candles).\n\n"
             "Hard Constraints:\n"
             "- Action=HOLD if spread > max_spread_pips.\n"
+            "- Total Net Position Constraint: abs(current_net + new_units) <= max_net_units.\n"
             "- DIRECTIONAL ENFORCEMENT: If state.current_net > 0 (Long), you MUST NOT OPEN 'sell' (Use CLOSE to exit). If < 0, MUST NOT OPEN 'buy'.\n"
             "- sl_pips must be in [limits.min_sl_pips, limits.max_sl_pips].\n"
             "- tp_pips: Use 0 for No TP. Use null to accept default/hint. If > 0, must be >= 10.\n\n"
@@ -141,8 +142,6 @@ def gpt_decide_trade(context: dict) -> dict:
     try:
         resp = openai_client.responses.create(
             model=GPT_MODEL,
-            reasoning={"effort": "low"},   # speed + consistency
-            max_output_tokens=200,         # tool call only
             instructions=instructions,
             tools=DECIDE_TRADE_TOOL,
             tool_choice={"type": "function", "name": "decide_trade"},
@@ -1083,20 +1082,7 @@ def webhook():
              "trend_bias": trend_bias
         }
 
-        # --- PRE-GATING: NO SETUP (Optimization) ---
-        has_cross = _b(features.get("buyCross")) or _b(features.get("sellCross"))
-        is_strong_trend = adx >= 22
-        
-        if current_net == 0 and not (has_cross or is_strong_trend):
-             # Skip Spread Call + Skip GPT Token Cost
-             db_record_execution(
-                alert_id=alert_id, action="observe", instrument=pair,
-                current_net=current_net, spread_pips=None,
-                status="RULE_SKIP_NO_SETUP", meta=json.dumps({"adx": adx})
-             )
-             return {"status": "RULE_SKIP_NO_SETUP"}, 200
-
-        # --- FETCH PRICING (Now that we know we care) ---
+        # --- FETCH PRICING (Always fetch since we always want GPT) ---
         spread_pips_val = None
         if MAX_SPREAD_PIPS > 0:
             try:
