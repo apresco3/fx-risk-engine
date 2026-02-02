@@ -7,19 +7,85 @@ import time
 
 DB_PATH = "bot.db"
 
+
 def _safe_json_loads(s: str):
     try:
         return json.loads(s)
     except Exception:
         return {}
 
+
+def _fmt_num(x, fmt=":.2f"):
+    try:
+        return format(float(x), fmt)
+    except Exception:
+        return str(x)
+
+
+def _fmt_signed(x, fmt=":.1f"):
+    try:
+        return f"{float(x):{fmt}}"
+    except Exception:
+        return str(x)
+
+
+def _format_degradation_exit(meta: dict) -> str:
+    """
+    meta from bot.py degradation exit:
+      {
+        "action":"CLOSE",
+        "confidence":1.0,
+        "reason":"RULE_DEGRADATION_EXIT: ...",
+        "rule":"DEGRADATION_EXIT",
+        "mode":"STALL"|"PROFIT_PROTECT",
+        "held_min": float,
+        "pips_now": float,
+        "adx": float,
+        "ema_sep_pips": float,
+        "trend_bias": "mixed"|...
+      }
+    """
+    mode = str(meta.get("mode", "UNKNOWN"))
+    held = meta.get("held_min", None)
+    pips = meta.get("pips_now", meta.get("pips", None))
+    adx = meta.get("adx", None)
+    sep = meta.get("ema_sep_pips", None)
+    tb = meta.get("trend_bias", None)
+
+    parts = [f"Degradation Exit ({mode})"]
+    if held is not None:
+        parts.append(f"held {_fmt_num(held, ':.1f')}m")
+    if pips is not None:
+        # show sign
+        try:
+            parts.append(f"pips {float(pips):+.1f}")
+        except Exception:
+            parts.append(f"pips {pips}")
+    if adx is not None:
+        parts.append(f"ADX {_fmt_num(adx, ':.1f')}")
+    if sep is not None:
+        parts.append(f"EMA sep {_fmt_num(sep, ':.2f')} pips")
+    if tb is not None:
+        parts.append(f"trend_bias={tb}")
+
+    return ", ".join(parts) + "."
+
+
 def format_reason(data, meta):
     """
-    Prefer GPT reason/confidence when present.
-    Otherwise derive a human reason from status/spread/meta.
+    Prefer:
+      1) Explicit rule-based meta (DEGRADATION_EXIT)
+      2) GPT reason/confidence when present
+      3) Derived human reason from status/spread/meta
     """
     gpt_reason = None
     confidence = None
+
+    # --- NEW: Rule-based close (degradation exit) ---
+    if isinstance(meta, dict) and meta.get("rule") == "DEGRADATION_EXIT":
+        gpt_reason = _format_degradation_exit(meta)
+        confidence = meta.get("confidence", 1.0)
+        return gpt_reason, confidence
 
     # OPEN meta often nested: {"gpt": {...}, "features": {...}}
     if isinstance(meta, dict) and "gpt" in meta and isinstance(meta["gpt"], dict):
@@ -48,6 +114,27 @@ def format_reason(data, meta):
         elif status == "RULE_BLOCKED_SPREAD_UNKNOWN":
             gpt_reason = "Spread unknown: pricing fetch failed."
 
+        # --- CHOP GATE ---
+        elif status == "RULE_BLOCKED_CHOP":
+            if isinstance(meta, dict):
+                sep = meta.get("ema_sep")
+                req = meta.get("required")
+                if isinstance(sep, (int, float)):
+                    sep = f"{sep:.2f}"
+                if isinstance(req, (int, float)):
+                    req = f"{req:.2f}"
+                gpt_reason = f"Chop Gate: EMA separation {sep} pips < required {req} pips."
+            else:
+                gpt_reason = "Blocked by Chop Gate (low momentum)."
+
+        # --- SUNDAY FILTER ---
+        elif status == "RULE_BLOCKED_SUNDAY_OPEN":
+            if isinstance(meta, dict):
+                h = meta.get("hour_utc", "?")
+                gpt_reason = f"Sunday Liquidity Filter: Blocked (Hour {h} UTC)."
+            else:
+                gpt_reason = "Sunday Liquidity Filter: Blocked due to time/day."
+
         elif status == "RULE_BLOCKED_OVEREXTENDED":
             gpt_reason = "Blocked: overextended entry (mean-reversion risk)."
 
@@ -75,6 +162,12 @@ def format_reason(data, meta):
         elif status == "NETWORK_ERROR":
             gpt_reason = "Network error when calling OANDA."
 
+        elif status == "SAFETY_BLOCKED_FLIP":
+            reason = "Safety Block: Cannot flip Net Long/Short instantly."
+            if isinstance(meta, dict) and "reason" in meta:
+                reason = meta["reason"]
+            gpt_reason = reason
+
         else:
             gpt_reason = "No reason found in meta."
 
@@ -83,10 +176,12 @@ def format_reason(data, meta):
 
     return gpt_reason, confidence
 
+
 def _fmt_ts_both(ts: int) -> tuple[str, str]:
     dt_local = datetime.datetime.fromtimestamp(ts)
     dt_utc = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
     return dt_local.strftime("%Y-%m-%d %H:%M:%S"), dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+
 
 def print_execution(title, data, meta):
     gpt_reason, confidence = format_reason(data, meta)
@@ -94,9 +189,9 @@ def print_execution(title, data, meta):
     ts = int(data.get("ts", 0) or 0)
     local_str, utc_str = _fmt_ts_both(ts)
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print(f" {title}: {str(data.get('action', '')).upper()} on {data['instrument']} ({data.get('status', 'N/A')})")
-    print("="*60)
+    print("=" * 60)
     print(f"TIME (LOCAL): {local_str}")
     print(f"TIME (UTC):   {utc_str} UTC")
     print(f"CONFIDENCE:   {confidence}")
@@ -105,6 +200,7 @@ def print_execution(title, data, meta):
     print("-" * 20)
     print(textwrap.fill(str(gpt_reason), width=80))
     print("-" * 20)
+
 
 def main():
     if not os.path.exists(DB_PATH):
@@ -137,9 +233,9 @@ def main():
 
     conn.close()
 
-    print("\n" + "#"*60)
+    print("\n" + "#" * 60)
     print(" SYSTEM STATUS (Last Report per Pair)")
-    print("#"*60)
+    print("#" * 60)
 
     if not recent_rows:
         print("No activity in last 24 hours.")
@@ -149,9 +245,9 @@ def main():
             meta = _safe_json_loads(data["meta"]) if data.get("meta") else {}
             print_execution(f"LATEST LOG: {data['instrument']}", data, meta)
 
-    print("\n\n" + "#"*60)
+    print("\n\n" + "#" * 60)
     print(" 💰 ACTIVE PORTFOLIO (Open Trades Only)")
-    print("#"*60)
+    print("#" * 60)
 
     if not active_trades:
         print("\n[FLAT] No open trades currently.")
@@ -163,7 +259,7 @@ def main():
             if entry_ms:
                 entry_time = datetime.datetime.fromtimestamp(entry_ms / 1000.0)
                 duration = datetime.datetime.now() - entry_time
-                duration_str = str(duration).split('.')[0]
+                duration_str = str(duration).split(".")[0]
             else:
                 duration_str = "N/A"
 
@@ -174,6 +270,7 @@ def main():
             print(f"    DURATION:    {duration_str}")
             print(f"    UPL (Est):   {t.get('unrealized_pl_home', '0.00')} {os.getenv('ACCOUNT_CURRENCY', 'USD')}")
             print("-" * 40)
+
 
 if __name__ == "__main__":
     main()

@@ -224,6 +224,23 @@ MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "1"))
 MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))
 MIN_EMA_SEP_PIPS = float(os.getenv("MIN_EMA_SEP_PIPS", "0.9"))  # NEW: Anti-chop floor
 
+# ============================================================
+# NEW: Trade Degradation Exit (stall + profit-protect)
+# ============================================================
+DEGRADE_EXIT_ENABLED = os.getenv("DEGRADE_EXIT_ENABLED", "true").lower() == "true"
+
+# Stall exit: been in trade long enough AND basically flat AND now choppy
+DEGRADE_MIN_MINUTES = int(os.getenv("DEGRADE_MIN_MINUTES", "30"))
+DEGRADE_STALL_PIPS = float(os.getenv("DEGRADE_STALL_PIPS", "2.0"))
+
+# "Chop" definition for degradation while IN a trade
+DEGRADE_ADX_MAX = float(os.getenv("DEGRADE_ADX_MAX", "18.0"))
+DEGRADE_EMA_SEP_PIPS = float(os.getenv("DEGRADE_EMA_SEP_PIPS", "3.0"))
+
+# Profit-protect: if up X pips and chop appears, bank it
+DEGRADE_PROFIT_PROTECT_MIN_MINUTES = int(os.getenv("DEGRADE_PROFIT_PROTECT_MIN_MINUTES", "10"))
+DEGRADE_PROFIT_PROTECT_PIPS = float(os.getenv("DEGRADE_PROFIT_PROTECT_PIPS", "8.0"))
+
 RISK_PCT = Decimal(os.getenv("RISK_PCT", "0.0025"))
 MAX_RISK_USD = Decimal(os.getenv("MAX_RISK_USD", "100"))
 DAILY_LOSS_LIMIT_USD = Decimal(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))
@@ -619,6 +636,12 @@ def compute_unrealized_pl_home(instrument: str, side: str, units: int, entry_pri
     if conv is None:
         return None
     return pl_quote * conv
+
+def pips_from_entry(instrument: str, side: str, entry: Decimal, mark: Decimal) -> float:
+    pip = pip_size_for(instrument)
+    if side == "buy":
+        return float((mark - entry) / pip)
+    return float((entry - mark) / pip)
 
 # ============================================================
 # Risk sizing
@@ -1185,6 +1208,115 @@ def webhook():
                 )
             except Exception:
                 pass
+
+        # ============================================================
+        # NEW: TRADE DEGRADATION EXIT (only when IN a trade)
+        # ============================================================
+        if DEGRADE_EXIT_ENABLED and current_net != 0:
+            ts2 = get_trade_state(pair)
+            if ts2 and int(ts2.get("is_open", 0)) == 1 and ts2.get("entry_price") and ts2.get("entry_time_ms"):
+                try:
+                    entry = Decimal(str(ts2["entry_price"]))
+                    entry_time_ms = int(ts2["entry_time_ms"])
+                    now_ms = int(time.time() * 1000)
+                    held_min = (now_ms - entry_time_ms) / 60000.0
+
+                    # Determine side from DB; fall back to net sign
+                    side_ts = str(ts2.get("side") or ("buy" if current_net > 0 else "sell")).lower()
+                    if side_ts not in ("buy", "sell"):
+                        side_ts = "buy" if current_net > 0 else "sell"
+
+                    # Current market state
+                    mark = get_mid_price(pair)
+                    ema_sep_now = _f(features.get("ema_sep_pips", 0))
+                    adx_now = _f(features.get("adx", 0))
+                    trend_bias_now = analysis.get("trend_bias", "mixed")
+
+                    # JPY pairs can use a slightly higher EMA separation threshold
+                    degrade_sep = DEGRADE_EMA_SEP_PIPS * (1.2 if "JPY" in pair else 1.0)
+
+                    # "Chop" / degradation condition while IN a position
+                    is_degraded = (
+                        adx_now <= DEGRADE_ADX_MAX and
+                        ema_sep_now <= degrade_sep and
+                        trend_bias_now == "mixed"
+                    )
+
+                    # PnL in pips from entry
+                    pips_now = pips_from_entry(pair, side_ts, entry, mark)
+
+                    # Two exits:
+                    # 1) Stall: long time + basically flat + degraded
+                    stall_exit = (
+                        held_min >= DEGRADE_MIN_MINUTES and
+                        abs(pips_now) <= DEGRADE_STALL_PIPS and
+                        is_degraded
+                    )
+
+                    # 2) Profit-protect: decent winner + degraded
+                    profit_protect_exit = (
+                        held_min >= DEGRADE_PROFIT_PROTECT_MIN_MINUTES and
+                        pips_now >= DEGRADE_PROFIT_PROTECT_PIPS and
+                        is_degraded
+                    )
+
+                    if stall_exit or profit_protect_exit:
+                        reason = (
+                            f"RULE_DEGRADATION_EXIT: held={held_min:.1f}m, "
+                            f"pips={pips_now:.1f}, adx={adx_now:.1f}, "
+                            f"ema_sep={ema_sep_now:.2f} (req<={degrade_sep:.2f}), "
+                            f"trend_bias={trend_bias_now}, "
+                            f"mode={'STALL' if stall_exit else 'PROFIT_PROTECT'}"
+                        )
+
+                        r = close_position(pair)
+                        upsert_trade_state(
+                            instrument=pair,
+                            is_open=False,
+                            side=None,
+                            units=None,
+                            entry_price=None,
+                            entry_time_ms=None,
+                            last_mark_price=None,
+                            unrealized_pl_home=None,
+                            realized_pl_home=None
+                        )
+
+                        status = "OK" if r.ok else "OANDA_ERROR"
+                        db_record_execution(
+                            alert_id=alert_id,
+                            action="close",
+                            instrument=pair,
+                            side=None,
+                            units=None,
+                            sl_pips=None,
+                            tp_pips=None,
+                            current_net=current_net,
+                            projected_net=None,
+                            spread_pips=spread_pips_val,
+                            oanda_http=r.status_code,
+                            status=status,
+                            oanda_response=r.text,
+                            meta=json.dumps({
+                                "action": "CLOSE",
+                                "confidence": 1.0,
+                                "reason": reason,
+                                "rule": "DEGRADATION_EXIT",
+                                "mode": ("STALL" if stall_exit else "PROFIT_PROTECT"),
+                                "held_min": held_min,
+                                "pips_now": pips_now,
+                                "adx": adx_now,
+                                "ema_sep_pips": ema_sep_now,
+                                "trend_bias": trend_bias_now
+                            })
+                        )
+
+                        return {"status": status, "action": "close", "reason": reason}, (200 if r.ok else 502)
+
+                except Exception as e:
+                    # Don't crash the bot if degradation logic fails
+                    log(f"DEGRADE_EXIT_FAIL | {pair} | {repr(e)}")
+
 
         gpt_ctx = {
             "pair": pair,

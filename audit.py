@@ -34,7 +34,44 @@ def _start_of_today_ts():
         return int(start_local.timestamp())
 
 
+def _fmt_num(x, fmt=":.2f"):
+    try:
+        return format(float(x), fmt)
+    except Exception:
+        return str(x)
+
+
+def _format_degradation_exit(meta: dict) -> str:
+    mode = str(meta.get("mode", "UNKNOWN"))
+    held = meta.get("held_min", None)
+    pips = meta.get("pips_now", meta.get("pips", None))
+    adx = meta.get("adx", None)
+    sep = meta.get("ema_sep_pips", None)
+    tb = meta.get("trend_bias", None)
+
+    parts = [f"Degradation Exit ({mode})"]
+    if held is not None:
+        parts.append(f"held {_fmt_num(held, ':.1f')}m")
+    if pips is not None:
+        try:
+            parts.append(f"pips {float(pips):+.1f}")
+        except Exception:
+            parts.append(f"pips {pips}")
+    if adx is not None:
+        parts.append(f"ADX {_fmt_num(adx, ':.1f')}")
+    if sep is not None:
+        parts.append(f"EMA sep {_fmt_num(sep, ':.2f')} pips")
+    if tb is not None:
+        parts.append(f"trend_bias={tb}")
+
+    return ", ".join(parts)
+
+
 def derive_reason(status: str, spread_pips, meta: dict) -> str:
+    # --- NEW: Degradation exit rule ---
+    if isinstance(meta, dict) and meta.get("rule") == "DEGRADATION_EXIT":
+        return _format_degradation_exit(meta)
+
     s = (status or "").upper()
 
     if s == "RULE_BLOCKED_SPREAD":
@@ -47,6 +84,22 @@ def derive_reason(status: str, spread_pips, meta: dict) -> str:
 
     if s == "RULE_BLOCKED_SPREAD_UNKNOWN":
         return "Spread unknown: pricing fetch failed."
+
+    # --- CHOP GATE ---
+    if s == "RULE_BLOCKED_CHOP":
+        if isinstance(meta, dict):
+            sep = meta.get("ema_sep")
+            req = meta.get("required")
+            if isinstance(sep, (int, float)) and isinstance(req, (int, float)):
+                return f"Chop Gate: EMA sep {sep:.2f} pips < required {req:.2f}"
+        return "Blocked by Chop Gate (low momentum)."
+
+    # --- SUNDAY FILTER ---
+    if s == "RULE_BLOCKED_SUNDAY_OPEN":
+        if isinstance(meta, dict):
+            h = meta.get("hour_utc", "?")
+            return f"Sunday Liquidity Filter: Blocked (Hour {h} UTC)"
+        return "Sunday Liquidity Filter: Blocked due to time/day."
 
     if s == "RULE_BLOCKED_OVEREXTENDED":
         if isinstance(meta, dict):
@@ -73,6 +126,12 @@ def derive_reason(status: str, spread_pips, meta: dict) -> str:
     if s == "STATE_FETCH_FAIL":
         return "Failed to fetch open positions/state."
 
+    if s == "SAFETY_BLOCKED_FLIP":
+        # Sometimes meta is empty; sometimes it includes a reason string.
+        if isinstance(meta, dict) and "reason" in meta:
+            return str(meta["reason"])
+        return "Safety Block: Cannot flip Net Long/Short instantly."
+
     if s.startswith("RISK_BLOCKED_"):
         return s
 
@@ -89,6 +148,13 @@ def derive_reason(status: str, spread_pips, meta: dict) -> str:
 
 
 def extract_gpt_fields(meta: dict):
+    """
+    Returns (confidence, reason) if present.
+
+    OPEN meta often: {"gpt": {...}, "features": {...}}
+    HOLD/CLOSE meta often flat: {"confidence":..., "reason":...}
+    RULE close meta (degradation) also flat: {"rule":"DEGRADATION_EXIT", ...}
+    """
     if not isinstance(meta, dict):
         return None, None
 
@@ -97,7 +163,7 @@ def extract_gpt_fields(meta: dict):
         g = meta["gpt"]
         return g.get("confidence"), g.get("reason")
 
-    # HOLD/CLOSE meta often flat
+    # Flat meta (HOLD/CLOSE/rules)
     if "reason" in meta or "confidence" in meta:
         return meta.get("confidence"), meta.get("reason")
 
@@ -123,8 +189,8 @@ def show_today_decisions():
 
     day_label = "UTC" if USE_UTC_DAY else "LOCAL"
     print(f"\n########## AUDIT — TODAY ({day_label}) ##########\n")
-    print(f"{'LOCAL':<8} | {'UTC':<8} | {'PAIR':<8} | {'ACTION':<7} | {'STATUS':<24} | {'SPRD':>6} | {'CONF':>5} | REASON")
-    print("-" * 150)
+    print(f"{'LOCAL':<8} | {'UTC':<8} | {'PAIR':<8} | {'ACTION':<7} | {'STATUS':<26} | {'SPRD':>6} | {'CONF':>5} | REASON")
+    print("-" * 160)
 
     rows = cur.fetchall()
     if not rows:
@@ -151,14 +217,21 @@ def show_today_decisions():
         meta = _safe_json_loads(row["meta"]) if row["meta"] else {}
 
         conf, reason = extract_gpt_fields(meta)
+
+        # If no direct reason, derive from status/meta (also handles degradation rule)
         if not reason:
             reason = derive_reason(status, spread, meta)
+        else:
+            # If it's a degradation exit, prefer the structured formatter even if reason exists
+            if isinstance(meta, dict) and meta.get("rule") == "DEGRADATION_EXIT":
+                reason = _format_degradation_exit(meta)
 
         conf_disp = f"{float(conf):.2f}" if conf is not None else "N/A"
-        reason_s = str(reason)
-        reason_display = (reason_s[:90] + "..") if len(reason_s) > 90 else reason_s
 
-        print(f"{local_str:<8} | {utc_str:<8} | {pair:<8} | {action:<7} | {status:<24} | {spread_disp:>6} | {conf_disp:>5} | {reason_display}")
+        reason_s = str(reason)
+        reason_display = (reason_s[:100] + "..") if len(reason_s) > 100 else reason_s
+
+        print(f"{local_str:<8} | {utc_str:<8} | {pair:<8} | {action:<7} | {status:<26} | {spread_disp:>6} | {conf_disp:>5} | {reason_display}")
 
     conn.close()
 
