@@ -6,6 +6,7 @@ import os
 import time
 import sqlite3
 import json
+import random  # Added for FIFO randomization
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Optional, Tuple, Dict, Any
 
@@ -26,12 +27,13 @@ except Exception:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 GPT_ENABLED = os.getenv("GPT_ENABLED", "false").lower() == "true"
-GPT_MODEL = os.getenv("GPT_MODEL", "gpt-5.2")
+# Ensure you use a valid model name (e.g., gpt-4o or gpt-3.5-turbo)
+GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o") 
 GPT_MIN_CONFIDENCE = float(os.getenv("GPT_MIN_CONFIDENCE", "0.55"))
 
 # Safety: default disallows scaling up (1.0 => only reduce or unchanged)
 GPT_MAX_UNITS_MULT = float(os.getenv("GPT_MAX_UNITS_MULT", "1.0"))
-GPT_TIMEOUT_SECONDS = float(os.getenv("GPT_TIMEOUT_SECONDS", "12"))
+GPT_TIMEOUT_SECONDS = float(os.getenv("GPT_TIMEOUT_SECONDS", "30"))
 GPT_ENTRY_ADX = int(os.getenv("GPT_ENTRY_ADX", "25"))
 
 openai_client = None
@@ -109,36 +111,35 @@ def gpt_decide_trade(context: dict) -> dict:
         safe_hold["reason"] = "GPT_NO_CLIENT"
         return safe_hold
 
+    # --- [FIXED] Updated Strategic Prompt with Exhaustion Filter ---
     instructions = (
-            "You are an FX execution gatekeeper. Output ONLY the decide_trade tool call.\n\n"
-            "Context:\n"
-            "- You receive a current snapshot and a lookback sequence.\n"
-            "- Pre-computed flags (is_overextended, trend_bias) are provided in 'analysis'. Use them.\n\n"
-            "Interpretation of inputs:\n"
-            "- state.current_net: 0=flat; >0 long; <0 short.\n"
-            "- state.spread_pips: Current spread (check against limits.max_spread_pips).\n"
-            "- features.adx: Trend strength (higher = stronger trend).\n"
-            "- features.ema_sep_pips: Fast/Slow EMA gap (small gap = chop).\n"
-            "- analysis.is_overextended: TRUE if price is too far from mean (Do not buy High/Sell Low).\n"
-            "- analysis.trend_bias: 'bullish', 'bearish', or 'mixed' (based on last 5 candles).\n\n"
-            "Hard Constraints:\n"
-            "- Action=HOLD if spread > max_spread_pips.\n"
-            "- Total Net Position Constraint: abs(current_net + new_units) <= max_net_units.\n"
-            "- DIRECTIONAL ENFORCEMENT: If state.current_net > 0 (Long), you MUST NOT OPEN 'sell' (Use CLOSE to exit). If < 0, MUST NOT OPEN 'buy'.\n"
-            "- sl_pips must be in [limits.min_sl_pips, limits.max_sl_pips].\n"
-            "- tp_pips: Use 0 for No TP. Use null to accept default/hint. If > 0, must be >= 10.\n\n"
-            "Execution Logic:\n"
-            "1. Setup A (Cross): Cross detected + Momentum Confirmation + ADX/SEP filters met.\n"
-            f"2. Setup B (Continuation): ADX >= {GPT_ENTRY_ADX} + EMA Sep > 2.0 + Trend Bias MUST match side (no mixed).\n"
-            "3. Sizing: units_mult = 1.0. Reduce to 0.5 if ADX [15-17], low separation, or weak momentum.\n\n"
-            "CLOSE rules (allowed to close):\n"
-            "- If Long: CLOSE if trendDown is true OR sellCross is true OR adx < 14.\n"
-            "- If Short: CLOSE if trendUp is true OR buyCross is true OR adx < 14.\n\n"
-            "Confidence:\n"
-            "- Perfect alignment: >= 0.75.\n"
-            "- Trend continuation: >= 0.70.\n"
-            "- Uncertain/Chop/Blocked: HOLD with confidence <= 0.55."
-        )
+        "You are an FX execution gatekeeper. Output ONLY the decide_trade tool call.\n\n"
+        "Context:\n"
+        "- Analysis flags (is_overextended, trend_bias) are provided.\n"
+        "- 'dist_to_ema_200' tells you the macro trend. Positive = Bullish, Negative = Bearish.\n\n"
+        
+        "Strategy Rules:\n"
+        "1. MACRO FILTER (Crucial): \n"
+        "   - If dist_to_ema_200 > 0: ONLY OPEN BUY (or HOLD).\n"
+        "   - If dist_to_ema_200 < 0: ONLY OPEN SELL (or HOLD).\n"
+        "   - Do not fight the 200 EMA.\n\n"
+
+        "2. ENTRY (Pullback/Momentum):\n"
+        "   - OPEN if features.adx > 20 AND features.adx < 40.\n"
+        "   - BLOCK ENTRY if features.adx >= 40 (Trend Likely Exhausted/Hyperextended).\n"
+        "   - trend_bias must align with dist_to_ema_200.\n"
+        "   - Avoid opening if analysis.is_overextended is TRUE (Wait for pullback).\n\n"
+
+        "3. EXIT (Let Winners Run):\n"
+        "   - DO NOT RECOMMEND CLOSING just because of small profits.\n"
+        "   - ONLY CLOSE if: Trend has fully reversed (e.g., price crosses EMA 200) OR Market Structure break detected.\n"
+        "   - Otherwise, return ACTION: HOLD and let the TP/SL manage the trade.\n\n"
+
+        "Output Logic:\n"
+        "- If existing position matches Macro Trend: ACTION: HOLD.\n"
+        "- If no position AND signals align: ACTION: OPEN.\n"
+        "- If existing position fights Macro Trend: ACTION: CLOSE."
+    )
 
     try:
         resp = openai_client.responses.create(
@@ -178,7 +179,7 @@ def gpt_decide_trade(context: dict) -> dict:
 
                 reason = str(out.get("reason", "")).strip()[:1200]
 
-                # --- Normalization (Keep DB Clean) ---
+                # Keep DB clean
                 if action != "OPEN":
                     side = None
                     sl_pips = None
@@ -214,40 +215,80 @@ TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 
 MAX_UNITS = int(os.getenv("MAX_UNITS", "1000"))
 MAX_NET_UNITS = int(os.getenv("MAX_NET_UNITS", "2000"))
-MAX_ALERT_AGE_SECONDS = int(os.getenv("MAX_ALERT_AGE_SECONDS", "0"))
+GLOBAL_MAX_UNITS = int(os.getenv("GLOBAL_MAX_UNITS", "20000"))
 
-SL_PIPS_DEFAULT = int(os.getenv("SL_PIPS", "20"))
-TP_PIPS_DEFAULT = int(os.getenv("TP_PIPS", "40"))
-MAX_SL_PIPS = int(os.getenv("MAX_SL_PIPS", str(SL_PIPS_DEFAULT)))
-MAX_TP_PIPS = int(os.getenv("MAX_TP_PIPS", str(TP_PIPS_DEFAULT)))
-TP_ATR_MULTIPLIER = float(os.getenv("TP_ATR_MULTIPLIER", "1.5"))
-MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "1"))
+# Updated for M15 candles (15m * 60s + buffer)
+MAX_ALERT_AGE_SECONDS = int(os.getenv("MAX_ALERT_AGE_SECONDS", "1200"))
 
-MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2"))
+SL_PIPS_DEFAULT = int(os.getenv("SL_PIPS", "30"))
+TP_PIPS_DEFAULT = int(os.getenv("TP_PIPS", "60"))
+MAX_SL_PIPS = int(os.getenv("MAX_SL_PIPS", "150"))
+MAX_TP_PIPS = int(os.getenv("MAX_TP_PIPS", "300"))
+
+# Updated ATR multipliers for M15 volatility
+TP_ATR_MULTIPLIER = float(os.getenv("TP_ATR_MULTIPLIER", "3.0"))
+SL_ATR_MULTIPLIER = float(os.getenv("SL_ATR_MULTIPLIER", "2.5"))
+MIN_SL_PIPS = int(os.getenv("MIN_SL_PIPS", "15"))
+
+MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2.5"))
 MAX_SPREAD_PIPS_XAU = float(os.getenv("MAX_SPREAD_PIPS_XAU", "60.0"))
 MIN_EMA_SEP_PIPS = float(os.getenv("MIN_EMA_SEP_PIPS", "1.5"))
 
 # ============================================================
-# NEW: Trade Degradation Exit (stall + profit-protect)
+# FIFO safeguard (OANDA FIFO accounts)
+# ============================================================
+FIFO_ENFORCE_UNIQUE_UNITS = os.getenv("FIFO_ENFORCE_UNIQUE_UNITS", "true").lower() == "true"
+FIFO_BUMP_LIMIT = int(os.getenv("FIFO_BUMP_LIMIT", "50"))
+
+# ============================================================
+# Rollover / spread policy
+# ============================================================
+ROLLOVER_BLOCK_OPENS = os.getenv("ROLLOVER_BLOCK_OPENS", "true").lower() == "true"
+ROLLOVER_START_UTC = os.getenv("ROLLOVER_START_UTC", "21:55")  # HH:MM (UTC)
+ROLLOVER_END_UTC = os.getenv("ROLLOVER_END_UTC", "22:45")      # HH:MM (UTC)
+
+EXIT_SPREAD_MULT = float(os.getenv("EXIT_SPREAD_MULT", "1.5"))
+EXIT_SPREAD_MIN_ADD = float(os.getenv("EXIT_SPREAD_MIN_ADD", "0.0"))
+
+def _parse_hhmm(s: str) -> Tuple[int, int]:
+    s = (s or "").strip()
+    parts = s.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid HH:MM: {s}")
+    hh = int(parts[0])
+    mm = int(parts[1])
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError(f"Invalid HH:MM: {s}")
+    return hh, mm
+
+def in_rollover_window(dt_utc: datetime.datetime) -> bool:
+    try:
+        sh, sm = _parse_hhmm(ROLLOVER_START_UTC)
+        eh, em = _parse_hhmm(ROLLOVER_END_UTC)
+    except Exception:
+        return False
+
+    start = dt_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = dt_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    if end < start:
+        return (dt_utc >= start) or (dt_utc <= end)
+    return start <= dt_utc <= end
+
+# ============================================================
+# Trade Degradation Exit (stall + profit-protect)
 # ============================================================
 DEGRADE_EXIT_ENABLED = os.getenv("DEGRADE_EXIT_ENABLED", "true").lower() == "true"
-
-# Stall exit: been in trade long enough AND basically flat AND now choppy
 DEGRADE_MIN_MINUTES = int(os.getenv("DEGRADE_MIN_MINUTES", "30"))
 DEGRADE_STALL_PIPS = float(os.getenv("DEGRADE_STALL_PIPS", "2.0"))
-
-# "Chop" definition for degradation while IN a trade
 DEGRADE_ADX_MAX = float(os.getenv("DEGRADE_ADX_MAX", "18.0"))
 DEGRADE_EMA_SEP_PIPS = float(os.getenv("DEGRADE_EMA_SEP_PIPS", "3.0"))
-
-# Profit-protect: if up X pips and chop appears, bank it
 DEGRADE_PROFIT_PROTECT_MIN_MINUTES = int(os.getenv("DEGRADE_PROFIT_PROTECT_MIN_MINUTES", "10"))
 DEGRADE_PROFIT_PROTECT_PIPS = float(os.getenv("DEGRADE_PROFIT_PROTECT_PIPS", "8.0"))
 
 RISK_PCT = Decimal(os.getenv("RISK_PCT", "0.0025"))
 MAX_RISK_USD = Decimal(os.getenv("MAX_RISK_USD", "100"))
 DAILY_LOSS_LIMIT_USD = Decimal(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))
-
 ALLOW_NONQUOTE_HOME_SIZING = os.getenv("ALLOW_NONQUOTE_HOME_SIZING", "true").lower() == "true"
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
@@ -279,6 +320,8 @@ def db_conn():
 def db_init():
     conn = db_conn()
     cur = conn.cursor()
+    # Enable Write-Ahead Logging for concurrency safety
+    cur.execute("PRAGMA journal_mode=WAL;") 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
             alert_id TEXT PRIMARY KEY,
@@ -443,15 +486,13 @@ def seen_before(alert_id: str) -> bool:
 # OANDA helpers
 # ============================================================
 def pip_size_for(instrument: str) -> Decimal:
-    # FIX: XAU pips are typically treated as $0.10 increments (10 ticks of $0.01)
     if "XAU" in instrument:
-        return Decimal("0.1")
+        return Decimal("0.1") # Check your broker's spec for Gold
     if instrument.endswith("_JPY"):
         return Decimal("0.01")
     return Decimal("0.0001")
 
 def fmt_price_decimal(x: Decimal, instrument: str) -> str:
-    # FIX: XAU distances should be formatted to 0.01 (2dp)
     if "XAU" in instrument:
         places = Decimal("0.01")
     elif instrument.endswith("_JPY"):
@@ -462,6 +503,72 @@ def fmt_price_decimal(x: Decimal, instrument: str) -> str:
 
 def oanda_get_open_positions():
     return requests.get(f"{BASE_URL}/accounts/{ACCOUNT_ID}/openPositions", headers=HEADERS, timeout=10)
+
+def oanda_get_open_trades(instrument: str):
+    # Used for FIFO unique-unit sizing
+    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades"
+    params = {"state": "OPEN", "instrument": instrument}
+    return requests.get(url, headers=HEADERS, params=params, timeout=10)
+
+def get_open_trade_unit_sizes(instrument: str) -> set:
+    try:
+        r = oanda_get_open_trades(instrument)
+        if not r.ok:
+            return set()
+        data = r.json() or {}
+        trades = data.get("trades", []) or []
+        sizes = set()
+        for t in trades:
+            try:
+                sizes.add(abs(int(t.get("currentUnits", "0"))))
+            except Exception:
+                pass
+        return sizes
+    except Exception:
+        return None
+
+def fifo_make_units_unique(
+    instrument: str,
+    desired_units: int,
+    *,
+    min_units: int,
+    max_units: int,
+    bump_limit: int = 50
+) -> int:
+    try:
+        desired_units = int(desired_units)
+    except Exception:
+        desired_units = 1
+
+    min_units = max(1, int(min_units))
+    max_units = max(min_units, int(max_units))
+
+    desired_units = max(min_units, min(desired_units, max_units))
+
+    existing = get_open_trade_unit_sizes(instrument)
+    
+    # If the exact size doesn't exist, we are good
+    if existing is not None and desired_units not in existing:
+        return desired_units
+
+    # --- [FIXED] Randomization Strategy for FIFO ---
+    # Instead of purely linear bumping, try random offsets to avoid collision patterns
+    # Try up to 'bump_limit' attempts to find a unique slot
+    u = desired_units
+    for _ in range(max(0, int(bump_limit))):
+        offset = random.randint(1, 15) # Random jump between 1 and 15
+        
+        # Try adding
+        u_up = u + offset
+        if u_up <= max_units and (existing is None or u_up not in existing):
+            return u_up
+            
+        # Try subtracting
+        u_down = u - offset
+        if u_down >= min_units and (existing is None or u_down not in existing):
+            return u_down
+
+    return desired_units
 
 def oanda_get_pricing(instrument: str):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing"
@@ -481,9 +588,6 @@ def get_account_nav_and_currency():
     return nav, currency
 
 def get_price_snapshot(instrument: str) -> Tuple[Decimal, Decimal, Decimal]:
-    """
-    Returns (bid, ask, mid) using raw market bids/asks for execution.
-    """
     r = oanda_get_pricing(instrument)
     if not r.ok:
         raise RuntimeError(f"Failed to fetch pricing: HTTP {r.status_code} {r.text}")
@@ -493,18 +597,15 @@ def get_price_snapshot(instrument: str) -> Tuple[Decimal, Decimal, Decimal]:
         raise RuntimeError("No pricing data returned")
     p = prices[0]
 
-    # --- FIX: Use raw liquidity, not margin closeout ---
-    # OANDA returns a list of buckets, [0] is the best available price.
     if "bids" in p and p["bids"]:
         bid_s = p["bids"][0]["price"]
     else:
-        bid_s = p.get("closeoutBid") # Fallback only if raw missing
+        bid_s = p.get("closeoutBid")
 
     if "asks" in p and p["asks"]:
         ask_s = p["asks"][0]["price"]
     else:
-        ask_s = p.get("closeoutAsk") # Fallback only if raw missing
-    # ---------------------------------------------------
+        ask_s = p.get("closeoutAsk")
 
     bid = Decimal(str(bid_s))
     ask = Decimal(str(ask_s))
@@ -521,20 +622,132 @@ def get_mid_price(instrument: str) -> Decimal:
     _, _, mid = get_price_snapshot(instrument)
     return mid
 
-def get_net_units_for_instrument(instrument: str) -> int:
+def get_net_and_avg_entry_from_oanda(instrument: str) -> Tuple[int, Optional[str], Optional[Decimal]]:
     r = oanda_get_open_positions()
     if not r.ok:
         raise RuntimeError(f"Failed to fetch open positions: HTTP {r.status_code} {r.text}")
     data = r.json()
     for pos in data.get("positions", []):
-        if pos.get("instrument") == instrument:
-            long_units = int(pos.get("long", {}).get("units", "0"))
-            short_units = int(pos.get("short", {}).get("units", "0"))
-            return long_units + short_units
-    return 0
+        if pos.get("instrument") != instrument:
+            continue
+        long_units = int(pos.get("long", {}).get("units", "0"))
+        short_units = int(pos.get("short", {}).get("units", "0"))
+        net = long_units + short_units
+
+        if net > 0:
+            side = "buy"
+            ap = pos.get("long", {}).get("averagePrice")
+        elif net < 0:
+            side = "sell"
+            ap = pos.get("short", {}).get("averagePrice")
+        else:
+            side = None
+            ap = None
+
+        avg_price = Decimal(str(ap)) if ap is not None else None
+        return net, side, avg_price
+
+    return 0, None, None
+
+def get_total_exposure_units() -> int:
+    """
+    Sums the absolute value of units across ALL open positions on the account.
+    Used to prevent over-leveraging across multiple correlated pairs (USD Basket risk).
+    """
+    r = oanda_get_open_positions()
+    if not r.ok:
+        return 0
+    data = r.json()
+    total = 0
+    for pos in data.get("positions", []):
+        long_u = int(pos.get("long", {}).get("units", "0"))
+        short_u = int(pos.get("short", {}).get("units", "0"))
+        total += abs(long_u) + abs(short_u)
+    return total
+
+def sync_trade_state_from_oanda(
+    *,
+    instrument: str,
+    acct_ccy: Optional[str] = None,
+    entry_time_ms_hint: Optional[int] = None,
+    fallback_entry_price: Optional[Decimal] = None,
+    fallback_units_abs: Optional[int] = None
+) -> None:
+    prev = get_trade_state(instrument)
+    prev_is_open = bool(prev) and int(prev.get("is_open", 0) or 0) == 1
+    preserved_entry_time = None
+    if prev_is_open and prev.get("entry_time_ms"):
+        try:
+            preserved_entry_time = int(prev["entry_time_ms"])
+        except Exception:
+            preserved_entry_time = None
+
+    try:
+        net, side, avg_entry = get_net_and_avg_entry_from_oanda(instrument)
+    except Exception:
+        net, side, avg_entry = 0, None, None
+
+    if net == 0:
+        upsert_trade_state(
+            instrument=instrument,
+            is_open=False,
+            side=None,
+            units=None,
+            entry_price=None,
+            entry_time_ms=None,
+            last_mark_price=None,
+            unrealized_pl_home=None,
+            realized_pl_home=None
+        )
+        return
+
+    entry_price = avg_entry or fallback_entry_price
+    if entry_price is None:
+        try:
+            entry_price = get_mid_price(instrument)
+        except Exception:
+            entry_price = None
+
+    last_mark = None
+    try:
+        bid, ask, _ = get_price_snapshot(instrument)
+        if side == "buy":
+            last_mark = bid
+        elif side == "sell":
+            last_mark = ask
+        else:
+            last_mark = (bid + ask) / Decimal(2)
+    except Exception:
+        last_mark = None
+
+    units_abs = abs(net) if net is not None else (fallback_units_abs or None)
+    entry_time_ms = preserved_entry_time or entry_time_ms_hint or int(time.time() * 1000)
+
+    upl_home = None
+    if acct_ccy and entry_price is not None and last_mark is not None and side in ("buy", "sell") and units_abs:
+        try:
+            upl_home = compute_unrealized_pl_home(instrument, side, int(units_abs), entry_price, last_mark, acct_ccy)
+        except Exception:
+            upl_home = None
+
+    upsert_trade_state(
+        instrument=instrument,
+        is_open=True,
+        side=side,
+        units=int(units_abs) if units_abs is not None else None,
+        entry_price=entry_price,
+        entry_time_ms=entry_time_ms,
+        last_mark_price=last_mark,
+        unrealized_pl_home=upl_home,
+        realized_pl_home=(Decimal(str(prev["realized_pl_home"])) if prev and prev.get("realized_pl_home") else None)
+    )
+
+def get_net_units_for_instrument(instrument: str) -> int:
+    net, _, _ = get_net_and_avg_entry_from_oanda(instrument)
+    return int(net)
 
 def get_day_start_nav(nav_now: Decimal) -> Decimal:
-    day = datetime.datetime.utcnow().date().isoformat()
+    day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
     conn = db_conn()
     cur = conn.cursor()
     cur.execute("SELECT nav_start FROM daily_state WHERE day = ?", (day,))
@@ -713,6 +926,7 @@ def validate_payload(data: dict):
             return None, "Invalid pair format"
     if action == "close":
         return {"alert_id": alert_id, "action": action, "pair": pair}, None
+
     sl_pips = data.get("sl_pips", SL_PIPS_DEFAULT)
     tp_pips = data.get("tp_pips", TP_PIPS_DEFAULT)
     try:
@@ -722,9 +936,11 @@ def validate_payload(data: dict):
         return None, "sl_pips/tp_pips must be integers"
     sl_pips = max(MIN_SL_PIPS, min(sl_pips if sl_pips > 0 else SL_PIPS_DEFAULT, MAX_SL_PIPS))
     tp_pips = max(0, min(tp_pips if tp_pips >= 0 else TP_PIPS_DEFAULT, MAX_TP_PIPS))
+
     features = data.get("features", {}) or {}
     if not isinstance(features, dict):
         return None, "features must be an object"
+
     if action == "observe":
         return {
             "alert_id": alert_id,
@@ -734,6 +950,7 @@ def validate_payload(data: dict):
             "tp_pips": tp_pips,
             "features": features
         }, None
+
     side = str(data.get("side", "")).lower().strip()
     if side not in {"buy", "sell"}:
         return None, "Invalid side"
@@ -766,20 +983,28 @@ def check_cooldown(instrument: str, cooldown_minutes: int) -> bool:
     elapsed_minutes = (now - last_ts) / 60.0
     return elapsed_minutes >= cooldown_minutes
 
+def check_min_spacing(instrument: str, spacing_seconds: int) -> bool:
+    if spacing_seconds <= 0:
+        return True
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT ts FROM executions 
+        WHERE instrument = ? AND action = 'open' AND status = 'OK'
+        ORDER BY ts DESC LIMIT 1
+    """, (instrument,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return True
+    last_ts = row["ts"]
+    return (int(time.time()) - last_ts) >= spacing_seconds
+
 def _f(x, default=0.0):
     try:
         return float(x)
     except Exception:
         return default
-
-def _b(x) -> bool:
-    if isinstance(x, bool):
-        return x
-    if isinstance(x, (int, float)):
-        return x != 0
-    if isinstance(x, str):
-        return x.strip().lower() in ("true", "1", "yes", "y", "t")
-    return False
 
 # ============================================================
 # Core execution helper
@@ -796,8 +1021,25 @@ def execute_open_trade(
     current_net: int,
     nav: Decimal,
     acct_ccy: str,
-    meta: dict
+    meta: dict,
+    max_spread_pips: float
 ) -> Tuple[Dict[str, Any], int]:
+
+    # --- SAFETY BLOCK: NO OPENS DURING ROLLOVER WINDOW (UTC) ---
+    if ROLLOVER_BLOCK_OPENS and in_rollover_window(datetime.datetime.now(datetime.timezone.utc)):
+        db_record_execution(
+            alert_id=alert_id, action="open", instrument=pair, side=side,
+            units=None, sl_pips=sl_pips, tp_pips=tp_pips,
+            current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+            status="RISK_BLOCKED_ROLLOVER", oanda_http=None, oanda_response=None,
+            meta=json.dumps({
+                **(meta or {}),
+                "rollover_block_opens": True,
+                "rollover_start_utc": ROLLOVER_START_UTC,
+                "rollover_end_utc": ROLLOVER_END_UTC
+            })
+        )
+        return {"status": "RISK_BLOCKED_ROLLOVER", "reason": "OPEN blocked during rollover window."}, 200
 
     # --- SAFETY BLOCK: NO HEDGE/FLIP ENFORCEMENT ---
     if current_net > 0 and side == "sell":
@@ -820,31 +1062,28 @@ def execute_open_trade(
         )
         return {"status": "SAFETY_BLOCKED_FLIP", "reason": "Cannot OPEN BUY while Short. Use CLOSE first."}, 200
 
-    # 1. Spread Gate
-    if MAX_SPREAD_PIPS > 0:
-        current_max_spread = MAX_SPREAD_PIPS
-        if "XAU" in pair:
-            current_max_spread = MAX_SPREAD_PIPS_XAU
-        
-        if spread_pips_val is None:
-            db_record_execution(
-                alert_id=alert_id, action="open", instrument=pair, side=side,
-                units=None, sl_pips=sl_pips, tp_pips=tp_pips,
-                current_net=current_net, projected_net=None, spread_pips=None,
-                status="RISK_BLOCKED_PRICE_FETCH_FAIL", oanda_http=None, oanda_response=None,
-                meta=json.dumps(meta)
-            )
-            return {"status": "RISK_BLOCKED_PRICE_FETCH_FAIL"}, 503
+    # 1. Spread Gate 
+    current_max_spread = float(max_spread_pips) if max_spread_pips is not None else float(MAX_SPREAD_PIPS)
 
-        if spread_pips_val > current_max_spread:
-            db_record_execution(
-                alert_id=alert_id, action="open", instrument=pair, side=side,
-                units=None, sl_pips=sl_pips, tp_pips=tp_pips,
-                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
-                status="RISK_BLOCKED_SPREAD", oanda_http=None, oanda_response=None,
-                meta=json.dumps(meta)
-            )
-            return {"status": "RISK_BLOCKED_SPREAD", "spread_pips": spread_pips_val, "cap": current_max_spread}, 403
+    if spread_pips_val is None:
+        db_record_execution(
+            alert_id=alert_id, action="open", instrument=pair, side=side,
+            units=None, sl_pips=sl_pips, tp_pips=tp_pips,
+            current_net=current_net, projected_net=None, spread_pips=None,
+            status="RISK_BLOCKED_PRICE_FETCH_FAIL", oanda_http=None, oanda_response=None,
+            meta=json.dumps({**meta, "max_spread_pips": current_max_spread})
+        )
+        return {"status": "RISK_BLOCKED_PRICE_FETCH_FAIL"}, 503
+
+    if spread_pips_val > current_max_spread:
+        db_record_execution(
+            alert_id=alert_id, action="open", instrument=pair, side=side,
+            units=None, sl_pips=sl_pips, tp_pips=tp_pips,
+            current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+            status="RISK_BLOCKED_SPREAD", oanda_http=None, oanda_response=None,
+            meta=json.dumps({**meta, "max_spread_pips": current_max_spread})
+        )
+        return {"status": "RISK_BLOCKED_SPREAD", "spread_pips": spread_pips_val, "cap": current_max_spread}, 403
 
     # 2. Daily Loss Limit
     if DAILY_LOSS_LIMIT_USD > 0:
@@ -859,7 +1098,7 @@ def execute_open_trade(
             )
             return {"status": "RISK_BLOCKED_DAILY_LOSS_LIMIT"}, 403
 
-    # 3. Position Sizing Logic (Risk % + GPT Scale + Min/Max Constraints)
+    # 3. Position sizing (Risk % + GPT scale + Min/Max constraints)
     try:
         units = compute_units_from_risk(instrument=pair, sl_pips=sl_pips, nav=nav, account_ccy=acct_ccy)
     except Exception as e:
@@ -875,21 +1114,70 @@ def execute_open_trade(
 
     units_mult = max(0.1, min(float(units_mult), GPT_MAX_UNITS_MULT))
     units = int(units * units_mult)
-    
+
     min_units = int(os.getenv("MIN_TRADE_UNITS", "10"))
-    units = max(min_units, units) 
+    units = max(min_units, units)
     units = min(units, MAX_UNITS)
 
-    # --- P1 FIX: Enforce TP Floor (minimum 10 pips) in execution logic ---
+    # Enforce TP floor only if TP enabled
     if tp_pips is not None and tp_pips > 0:
         tp_pips = int(max(10, min(tp_pips, MAX_TP_PIPS)))
+
+    # 3b. FIFO safeguard
+    if FIFO_ENFORCE_UNIQUE_UNITS:
+        headroom = MAX_NET_UNITS - abs(int(current_net))
+        if headroom <= 0:
+            db_record_execution(
+                alert_id=alert_id, action="open", instrument=pair, side=side,
+                units=None, sl_pips=sl_pips, tp_pips=tp_pips,
+                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+                status="RISK_BLOCKED_MAX_NET_UNITS", oanda_http=None, oanda_response=None,
+                meta=json.dumps({**(meta or {}), "reason": "no_headroom_for_fifo"})
+            )
+            return {"status": "RISK_BLOCKED_MAX_NET_UNITS", "reason": "No headroom."}, 403
+
+        existing = get_open_trade_unit_sizes(pair)
+        if existing is None:
+            db_record_execution(
+                alert_id=alert_id, action="open", instrument=pair, side=side,
+                units=None, sl_pips=sl_pips, tp_pips=tp_pips,
+                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+                status="RISK_BLOCKED_FIFO_SIZES_UNKNOWN", oanda_http=None, oanda_response=None,
+                meta=json.dumps({**(meta or {}), "reason": "open_trades_fetch_failed"})
+            )
+            return {"status": "RISK_BLOCKED_FIFO_SIZES_UNKNOWN"}, 503
+
+        max_units_fifo = min(MAX_UNITS, max(min_units, headroom))
+        original_units = units
+
+        units = fifo_make_units_unique(
+            pair,
+            units,
+            min_units=min_units,
+            max_units=max_units_fifo,
+            bump_limit=FIFO_BUMP_LIMIT
+        )
+
+        # If still not unique, do NOT send an order that will likely cancel
+        if units in existing:
+            db_record_execution(
+                alert_id=alert_id, action="open", instrument=pair, side=side,
+                units=units, sl_pips=sl_pips, tp_pips=tp_pips,
+                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+                status="RISK_BLOCKED_FIFO_UNIQUE_UNAVAILABLE", oanda_http=None, oanda_response=None,
+                meta=json.dumps({**(meta or {}), "fifo_units_original": original_units, "fifo_units_final": units})
+            )
+            return {"status": "RISK_BLOCKED_FIFO_UNIQUE_UNAVAILABLE"}, 403
+
+        if units != original_units:
+            meta = {**(meta or {}), "fifo_units_original": original_units, "fifo_units_final": units}
 
     # 4. Absolute Max Risk Gate
     try:
         loss_unit = loss_per_unit_home(instrument=pair, sl_pips=sl_pips, account_ccy=acct_ccy)
         expected_loss = loss_unit * Decimal(units)
         max_loss = min(nav, MAX_RISK_USD)
-        
+
         if expected_loss > max_loss:
             db_record_execution(
                 alert_id=alert_id, action="open", instrument=pair, side=side,
@@ -909,7 +1197,7 @@ def execute_open_trade(
         )
         return {"status": "RISK_CALC_ERROR", "error": str(e)}, 403
 
-    # 5. Net Exposure Gate
+    # 5. Net exposure gate (Per Pair)
     signed_units = -units if side == "sell" else units
     projected_net = current_net + signed_units
 
@@ -923,10 +1211,25 @@ def execute_open_trade(
         )
         return {"status": "RISK_BLOCKED_MAX_NET_UNITS", "current_net": current_net, "projected_net": projected_net, "cap": MAX_NET_UNITS}, 403
 
+    # 5b. Global Exposure Gate (All Pairs)
+    try:
+        current_total_exposure = get_total_exposure_units()
+        if current_total_exposure + units > GLOBAL_MAX_UNITS:
+            db_record_execution(
+                alert_id=alert_id, action="open", instrument=pair, side=side,
+                units=units, sl_pips=sl_pips, tp_pips=tp_pips,
+                current_net=current_net, projected_net=None, spread_pips=spread_pips_val,
+                status="RISK_BLOCKED_GLOBAL_MAX_UNITS", oanda_http=None, oanda_response=None,
+                meta=json.dumps({**(meta or {}), "global_exposure": current_total_exposure, "cap": GLOBAL_MAX_UNITS})
+            )
+            return {"status": "RISK_BLOCKED_GLOBAL_MAX_UNITS", "current_total": current_total_exposure, "cap": GLOBAL_MAX_UNITS}, 403
+    except Exception as e:
+        log(f"GLOBAL EXPOSURE CHECK FAIL | {e}")
+        return {"status": "RISK_CHECK_FAIL", "error": str(e)}, 503
+
     # 6. Execute Order
     try:
         r = place_market_order(instrument=pair, signed_units=signed_units, sl_pips=sl_pips, tp_pips=tp_pips)
-        ok = r.ok
         body_text = r.text
         resp_json = {}
         try:
@@ -935,48 +1238,92 @@ def execute_open_trade(
         except Exception:
             resp_json = {}
 
-        log(f"OPEN | alert_id={alert_id} | {pair} {side} {signed_units} | net={current_net}->{projected_net} | SL={sl_pips} TP={tp_pips} | spread={spread_pips_val} | HTTP {r.status_code}")
+        filled = isinstance(resp_json, dict) and ("orderFillTransaction" in resp_json)
+        cancelled = isinstance(resp_json, dict) and ("orderCancelTransaction" in resp_json)
+        rejected = isinstance(resp_json, dict) and ("orderRejectTransaction" in resp_json)
+
+        cancel_reason = None
+        reject_reason = None
+
+        if cancelled:
+            octx = resp_json.get("orderCancelTransaction", {})
+            if isinstance(octx, dict):
+                cancel_reason = octx.get("reason") or octx.get("cancelReason")
+
+        if rejected:
+            ortx = resp_json.get("orderRejectTransaction", {})
+            if isinstance(ortx, dict):
+                reject_reason = ortx.get("rejectReason") or ortx.get("reason")
+
+        if bool(r.ok) and filled and not cancelled and not rejected:
+            status_txt = "OK"
+        else:
+            if rejected:
+                status_txt = "OANDA_REJECTED"
+            elif cancelled:
+                status_txt = "OANDA_CANCELLED"
+            else:
+                status_txt = "OANDA_ERROR"
+
+        extra = ""
+        if status_txt == "OANDA_CANCELLED" and cancel_reason:
+            extra = f" | cancel_reason={cancel_reason}"
+        elif status_txt == "OANDA_REJECTED" and reject_reason:
+            extra = f" | reject_reason={reject_reason}"
+
+        log(
+            f"OPEN | alert_id={alert_id} | {pair} {side} {signed_units} | "
+            f"net={current_net}->{projected_net} | SL={sl_pips} TP={tp_pips} | "
+            f"spread={spread_pips_val} | HTTP {r.status_code} | {status_txt}{extra}"
+        )
 
         db_record_execution(
             alert_id=alert_id, action="open", instrument=pair, side=side,
             units=units, sl_pips=sl_pips, tp_pips=tp_pips,
             current_net=current_net, projected_net=projected_net, spread_pips=spread_pips_val,
-            oanda_http=r.status_code, status=("OK" if ok else "OANDA_ERROR"),
+            oanda_http=r.status_code, status=status_txt,
             oanda_response=body_text,
-            meta=json.dumps(meta)
+            meta=json.dumps({
+                **meta,
+                "fill_detected": filled,
+                "cancel_detected": cancelled,
+                "reject_detected": rejected,
+                "oanda_cancel_reason": cancel_reason,
+                "oanda_reject_reason": reject_reason,
+            })
         )
 
-        # 7. Update Trade State
-        entry_price = None
+        # Update Trade State only if we have a fill or if we were already in a trade (sync anyway)
+        fallback_fill_price = None
         try:
-            if resp_json:
-                oft = resp_json.get("orderFillTransaction", {})
-                if isinstance(oft, dict) and "price" in oft:
-                    entry_price = Decimal(str(oft["price"]))
+            oft = resp_json.get("orderFillTransaction", {}) if isinstance(resp_json, dict) else {}
+            if isinstance(oft, dict) and "price" in oft:
+                fallback_fill_price = Decimal(str(oft["price"]))
         except Exception:
-            entry_price = None
+            fallback_fill_price = None
 
-        if entry_price is None:
+        if fallback_fill_price is None:
             try:
-                entry_price = get_mid_price(pair)
+                fallback_fill_price = get_mid_price(pair)
             except Exception:
-                entry_price = None
+                fallback_fill_price = None
 
-        if ok and entry_price is not None:
-            upsert_trade_state(
+        prev = get_trade_state(pair)
+        prev_is_open = bool(prev) and int(prev.get("is_open", 0) or 0) == 1
+        entry_time_ms_hint = int(prev.get("entry_time_ms")) if (prev_is_open and prev.get("entry_time_ms")) else int(time.time() * 1000)
+
+        if bool(r.ok):
+            # Sync to broker truth (handles fill/cancel and pyramids)
+            sync_trade_state_from_oanda(
                 instrument=pair,
-                is_open=True,
-                side=side,
-                units=abs(projected_net),
-                entry_price=entry_price,
-                entry_time_ms=int(time.time() * 1000),
-                last_mark_price=entry_price,
-                unrealized_pl_home=Decimal(0),
-                realized_pl_home=None
+                acct_ccy=acct_ccy,
+                entry_time_ms_hint=entry_time_ms_hint,
+                fallback_entry_price=fallback_fill_price,
+                fallback_units_abs=abs(projected_net)
             )
 
         return {
-            "status": "OK" if ok else "OANDA_ERROR",
+            "status": status_txt,
             "action": "open",
             "http_status": r.status_code,
             "instrument": pair,
@@ -989,8 +1336,10 @@ def execute_open_trade(
             "tp_pips": tp_pips,
             "spread_pips": spread_pips_val,
             "meta": meta,
+            "oanda_cancel_reason": cancel_reason,
+            "oanda_reject_reason": reject_reason,
             "response": (resp_json if resp_json else {"raw": body_text})
-        }, (200 if ok else 502)
+        }, (200 if status_txt == "OK" else 502)
 
     except requests.RequestException as e:
         db_record_execution(
@@ -1046,6 +1395,7 @@ def webhook():
                     oanda_http=item["http_status"], status=("OK" if item["ok"] else "OANDA_ERROR"),
                     oanda_response=str(item["response"]), meta=None
                 )
+                sync_trade_state_from_oanda(instrument=item["instrument"])
             return {"status": "OK", "results": results}, 200
         except Exception as e:
             db_record_execution(alert_id=alert_id, action="close_all", instrument="ALL", status="ERROR", oanda_response=repr(e), meta=None)
@@ -1057,12 +1407,8 @@ def webhook():
         try:
             r = close_position(pair)
             log(f"CLOSE | alert_id={alert_id} | {pair} | HTTP {r.status_code}")
-            upsert_trade_state(
-                instrument=pair, is_open=False, side=None, units=None,
-                entry_price=None, entry_time_ms=None, last_mark_price=None,
-                unrealized_pl_home=None, realized_pl_home=None
-            )
-            
+            sync_trade_state_from_oanda(instrument=pair)
+
             status = "OK" if r.ok else "OANDA_ERROR"
             db_record_execution(
                 alert_id=alert_id, action="close", instrument=pair,
@@ -1078,7 +1424,7 @@ def webhook():
         hint_sl = payload.get("sl_pips", SL_PIPS_DEFAULT)
         hint_tp = payload.get("tp_pips", TP_PIPS_DEFAULT)
 
-        # --- Stale Alert Guard ---
+        # Stale alert guard
         if MAX_ALERT_AGE_SECONDS > 0:
             tv_time_ms = features.get("time_ms")
             if tv_time_ms is not None:
@@ -1095,98 +1441,135 @@ def webhook():
                 except Exception:
                     log(f"STALE_GUARD_PARSE_FAIL | alert_id={alert_id}")
 
-        # --- OPTIMIZATION STEP 1: Fetch Position State ---
+        # Fetch state (net + avg entry)
         try:
-            current_net = get_net_units_for_instrument(pair)
+            current_net, _, _ = get_net_and_avg_entry_from_oanda(pair)
         except Exception as e:
             log(f"STATE_FETCH_FAIL | {repr(e)}")
             return {"status": "STATE_FETCH_FAIL", "error": str(e)}, 503
 
-        # If OANDA says 0, but DB thinks we are open, force close the DB record.
-        if current_net == 0:
-            ts = get_trade_state(pair)
-            if ts and int(ts.get("is_open", 0)) == 1:
-                log(f"AUTO-SYNC | {pair} is flat on OANDA but open in DB. Syncing...")
-                upsert_trade_state(
-                    instrument=pair, is_open=False, side=None, units=None, 
-                    entry_price=None, entry_time_ms=None, last_mark_price=None, 
-                    unrealized_pl_home=None, realized_pl_home=None
-                )
-
-        # --- OPTIMIZATION STEP 2: Lazy Load NAV/Currency ---
+        # Lazy load NAV/currency
         nav = None
         acct_ccy = None
-        
         if current_net != 0:
             try:
                 nav, acct_ccy = get_account_nav_and_currency()
             except Exception:
                 pass
 
-        # --- PRE-COMPUTE FLAGS ---
+        # Compute analysis flags
         dist_to_ema = _f(features.get("dist_to_ema_200", 0))
         adx = _f(features.get("adx", 0))
         is_overextended = False
-
-        if abs(dist_to_ema) > 50:
-            is_overextended = True
-        elif abs(dist_to_ema) > 40 and adx < 20:
-            is_overextended = True
         
-        # --- Robust Trend Bias ---
+        # --- [FIXED] JPY "Leash" Logic ---
+        # Allow wider extension for JPY pairs due to volatility
+        overextended_threshold = 100 if "JPY" in pair else 50
+        
+        if abs(dist_to_ema) > overextended_threshold:
+            is_overextended = True
+        elif abs(dist_to_ema) > (overextended_threshold * 0.8) and adx < 20:
+            is_overextended = True
+
         lookback = features.get("lookback", [])
         trend_bias = "mixed"
         if lookback and len(lookback) >= 5:
-            recent = lookback[:5]
+            recent = lookback[-5:]
             up_count = sum(1 for c in recent if _f(c.get("close")) > _f(c.get("open")))
             if up_count >= 4:
                 trend_bias = "bullish"
             elif up_count <= 1:
                 trend_bias = "bearish"
-        
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        in_roll = in_rollover_window(now_utc)
+
         analysis = {
             "is_overextended": is_overextended,
-            "trend_bias": trend_bias
+            "trend_bias": trend_bias,
+            "dist_to_ema_200": dist_to_ema,
+            "in_rollover_window": bool(in_roll)
         }
 
-        # --- FETCH PRICING (spread) ---
+        # --- Pricing snapshot ---
         spread_pips_val = None
-        if MAX_SPREAD_PIPS > 0:
+        bid = ask = mid = None
+
+        try:
+            bid, ask, mid = get_price_snapshot(pair)
+            spread_pips_val = float((ask - bid) / pip_size_for(pair))
+        except Exception:
+            spread_pips_val = None
+
+        # Compute UPL pips
+        upl_pips = 0.0
+        if current_net != 0:
             try:
-                spread_pips_val = get_spread_pips(pair)
+                sync_trade_state_from_oanda(instrument=pair, acct_ccy=acct_ccy)
             except Exception:
-                spread_pips_val = None
-            
-            if spread_pips_val is None:
-                db_record_execution(
-                    alert_id=alert_id, action="observe", instrument=pair,
-                    current_net=None, spread_pips=None,
-                    status="RULE_BLOCKED_SPREAD_UNKNOWN", meta=None
-                )
-                return {"status": "RULE_BLOCKED_SPREAD_UNKNOWN"}, 200
+                pass
 
-        # --- PRE-GATING: SPREAD & OVEREXTENSION ---
-        dynamic_spread_limit = MAX_SPREAD_PIPS
-        if "XAU" in pair:
-            dynamic_spread_limit = MAX_SPREAD_PIPS_XAU
+            ts_data = get_trade_state(pair)
+            if ts_data.get("entry_price") and ts_data.get("side") and bid is not None and ask is not None:
+                entry = Decimal(str(ts_data["entry_price"]))
+                side_ts = str(ts_data["side"]).lower()
+                mark = bid if side_ts == "buy" else ask
+                upl_pips = pips_from_entry(pair, side_ts, entry, mark)
 
-        if spread_pips_val is not None and spread_pips_val > dynamic_spread_limit:
+        if spread_pips_val is None:
+            db_record_execution(
+                alert_id=alert_id, action="observe", instrument=pair,
+                current_net=current_net, spread_pips=None,
+                status="RULE_BLOCKED_SPREAD_UNKNOWN", meta=None
+            )
+            return {"status": "RULE_BLOCKED_SPREAD_UNKNOWN"}, 200
+
+        # Dynamic per-pair spread limits
+        pair_spread_limits = {
+            "XAU_USD": MAX_SPREAD_PIPS_XAU,
+            "GBP_JPY": 6.0,
+            "GBP_USD": 4.0,
+            "USD_JPY": 3.0,
+            "EUR_USD": 2.5,
+            "AUD_USD": 2.5
+        }
+        dynamic_spread_limit = float(pair_spread_limits.get(pair, MAX_SPREAD_PIPS))
+
+        # Derived EXIT limit
+        exit_spread_limit = float(dynamic_spread_limit) * float(EXIT_SPREAD_MULT) + float(EXIT_SPREAD_MIN_ADD)
+        if exit_spread_limit < dynamic_spread_limit:
+            exit_spread_limit = dynamic_spread_limit
+
+        analysis["max_spread_pips_entry"] = dynamic_spread_limit
+        analysis["max_spread_pips_exit"] = exit_spread_limit
+        analysis["spread_exit_caution"] = bool(current_net != 0 and spread_pips_val > exit_spread_limit)
+
+        # Rollover block
+        if current_net == 0 and ROLLOVER_BLOCK_OPENS and in_roll:
+            db_record_execution(
+                alert_id=alert_id, action="observe", instrument=pair,
+                current_net=current_net, spread_pips=spread_pips_val,
+                status="RULE_BLOCKED_ROLLOVER_OPEN",
+                meta=json.dumps({
+                    "rollover_start_utc": ROLLOVER_START_UTC,
+                    "rollover_end_utc": ROLLOVER_END_UTC,
+                    "spread_pips": spread_pips_val
+                })
+            )
+            return {"status": "RULE_BLOCKED_ROLLOVER_OPEN"}, 200
+
+        # Spread gate
+        if spread_pips_val > dynamic_spread_limit and current_net == 0:
             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
                 current_net=current_net, spread_pips=spread_pips_val,
                 status="RULE_BLOCKED_SPREAD", meta=json.dumps({"limit": dynamic_spread_limit})
             )
             return {"status": "RULE_BLOCKED_SPREAD"}, 200
-        
-        # ============================================================
-        # CHOP GATE (Minimum EMA Separation)
-        # ============================================================
+
+        # Chop gate
         ema_sep = _f(features.get("ema_sep_pips", 0))
-        
-        required_sep = MIN_EMA_SEP_PIPS
-        if "JPY" in pair:
-            required_sep = MIN_EMA_SEP_PIPS * 1.2
-            
+        required_sep = MIN_EMA_SEP_PIPS * (1.2 if "JPY" in pair else 1.0)
         if current_net == 0 and ema_sep < required_sep:
             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
@@ -1196,10 +1579,7 @@ def webhook():
             )
             return {"status": "RULE_BLOCKED_CHOP", "ema_sep": ema_sep}, 200
 
-        # ============================================================
-        # SUNDAY LIQUIDITY FILTER (XAU)
-        # ============================================================
-        now_utc = datetime.datetime.utcnow()
+        # Sunday liquidity filter
         if "XAU" in pair and now_utc.weekday() == 6 and now_utc.hour < 22:
             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
@@ -1209,6 +1589,7 @@ def webhook():
             )
             return {"status": "RULE_BLOCKED_SUNDAY_OPEN"}, 200
 
+        # Overextended block
         if current_net == 0 and is_overextended:
             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
@@ -1216,37 +1597,8 @@ def webhook():
                 status="RULE_BLOCKED_OVEREXTENDED", meta=json.dumps(analysis)
             )
             return {"status": "RULE_BLOCKED_OVEREXTENDED"}, 200
-        
-        # --- Update Trade State (UPL) ---
-        ts = get_trade_state(pair)
-        if ts and int(ts.get("is_open", 0)) == 1 and acct_ccy:
-            try:
-                bid, ask, mid = get_price_snapshot(pair)
 
-                entry = Decimal(str(ts["entry_price"]))
-                side_ts = str(ts["side"]).lower()
-                units_ts = int(ts["units"])
-
-                # FIX: mark at closeout side so UPL matches OANDA UI
-                if side_ts == "buy":
-                    mark = bid
-                else:
-                    mark = ask
-
-                upl = compute_unrealized_pl_home(pair, side_ts, units_ts, entry, mark, acct_ccy)
-
-                upsert_trade_state(
-                    instrument=pair, is_open=True, side=side_ts, units=units_ts,
-                    entry_price=entry, entry_time_ms=int(ts.get("entry_time_ms") or (time.time()*1000)),
-                    last_mark_price=mark, unrealized_pl_home=upl,
-                    realized_pl_home=(Decimal(str(ts["realized_pl_home"])) if ts.get("realized_pl_home") else None)
-                )
-            except Exception:
-                pass
-
-        # ============================================================
-        # TRADE DEGRADATION EXIT (only when IN a trade)
-        # ============================================================
+        # Degradation exit
         if DEGRADE_EXIT_ENABLED and current_net != 0:
             ts2 = get_trade_state(pair)
             if ts2 and int(ts2.get("is_open", 0)) == 1 and ts2.get("entry_price") and ts2.get("entry_time_ms"):
@@ -1260,15 +1612,12 @@ def webhook():
                     if side_ts not in ("buy", "sell"):
                         side_ts = "buy" if current_net > 0 else "sell"
 
-                    bid, ask, mid = get_price_snapshot(pair)
-
-                    # FIX: use closeout mark for pips/profit logic too
+                    bid, ask, _ = get_price_snapshot(pair)
                     mark = bid if side_ts == "buy" else ask
 
                     ema_sep_now = _f(features.get("ema_sep_pips", 0))
                     adx_now = _f(features.get("adx", 0))
                     trend_bias_now = analysis.get("trend_bias", "mixed")
-
                     degrade_sep = DEGRADE_EMA_SEP_PIPS * (1.2 if "JPY" in pair else 1.0)
 
                     is_degraded = (
@@ -1300,18 +1649,47 @@ def webhook():
                             f"mode={'STALL' if stall_exit else 'PROFIT_PROTECT'}"
                         )
 
-                        r = close_position(pair)
-                        upsert_trade_state(
-                            instrument=pair,
-                            is_open=False,
-                            side=None,
-                            units=None,
-                            entry_price=None,
-                            entry_time_ms=None,
-                            last_mark_price=None,
-                            unrealized_pl_home=None,
-                            realized_pl_home=None
+                        # --- Exit-spread protection (STRICT for degradation exits) ---
+                        spread_block = (
+                            spread_pips_val is not None and
+                            exit_spread_limit is not None and
+                            float(spread_pips_val) > float(exit_spread_limit)
                         )
+
+                        if spread_block:
+                            block_meta = {
+                                "blocked_by": "EXIT_SPREAD",
+                                "rule": "DEGRADATION_EXIT",
+                                "mode": ("STALL" if stall_exit else "PROFIT_PROTECT"),
+                                "reason": reason,
+                                "spread_pips": float(spread_pips_val),
+                                "exit_spread_limit": float(exit_spread_limit),
+                                "held_min": held_min,
+                                "pips_now": pips_now,
+                                "adx": adx_now,
+                                "ema_sep_pips": ema_sep_now,
+                                "trend_bias": trend_bias_now,
+                                "in_rollover_window": bool(in_roll),
+                            }
+                            db_record_execution(
+                                alert_id=alert_id,
+                                action="observe",
+                                instrument=pair,
+                                current_net=current_net,
+                                spread_pips=spread_pips_val,
+                                status="RULE_BLOCKED_EXIT_SPREAD_DEGRADE",
+                                meta=json.dumps(block_meta),
+                            )
+                            return {
+                                "status": "RULE_BLOCKED_EXIT_SPREAD_DEGRADE",
+                                "reason": "Degradation exit blocked due to wide spread.",
+                                "spread_pips": spread_pips_val,
+                                "exit_spread_limit": exit_spread_limit,
+                            }, 200
+
+                        # --- Allowed to close ---
+                        r = close_position(pair)
+                        sync_trade_state_from_oanda(instrument=pair, acct_ccy=acct_ccy)
 
                         status = "OK" if r.ok else "OANDA_ERROR"
                         db_record_execution(
@@ -1338,11 +1716,13 @@ def webhook():
                                 "pips_now": pips_now,
                                 "adx": adx_now,
                                 "ema_sep_pips": ema_sep_now,
-                                "trend_bias": trend_bias_now
+                                "trend_bias": trend_bias_now,
+                                "in_rollover_window": bool(in_roll),
+                                "max_spread_pips_exit": exit_spread_limit,
                             })
                         )
-
                         return {"status": status, "action": "close", "reason": reason}, (200 if r.ok else 502)
+
 
                 except Exception as e:
                     log(f"DEGRADE_EXIT_FAIL | {pair} | {repr(e)}")
@@ -1350,7 +1730,7 @@ def webhook():
         gpt_ctx = {
             "pair": pair,
             "features": features,
-            "analysis": analysis, 
+            "analysis": analysis,
             "hint": {"sl_pips": hint_sl, "tp_pips": hint_tp},
             "limits": {
                 "min_sl_pips": MIN_SL_PIPS,
@@ -1358,12 +1738,18 @@ def webhook():
                 "max_tp_pips": MAX_TP_PIPS,
                 "max_units": MAX_UNITS,
                 "max_net_units": MAX_NET_UNITS,
-                "max_spread_pips": dynamic_spread_limit,
-                "gpt_max_units_mult": GPT_MAX_UNITS_MULT
+                "max_spread_pips_entry": dynamic_spread_limit,
+                "max_spread_pips_exit": exit_spread_limit,
+                "gpt_max_units_mult": GPT_MAX_UNITS_MULT,
+                "rollover_block_opens": bool(ROLLOVER_BLOCK_OPENS),
+                "rollover_start_utc": ROLLOVER_START_UTC,
+                "rollover_end_utc": ROLLOVER_END_UTC,
             },
             "state": {
                 "spread_pips": spread_pips_val,
-                "current_net": current_net
+                "current_net": current_net,
+                "upl_pips": round(float(upl_pips), 1),
+                "in_rollover_window": bool(in_roll),
             },
             "risk": {
                 "risk_pct": str(RISK_PCT),
@@ -1373,7 +1759,7 @@ def webhook():
 
         gpt_decision = gpt_decide_trade(gpt_ctx)
 
-        if gpt_decision["confidence"] < GPT_MIN_CONFIDENCE or gpt_decision["action"] == "HOLD":
+        if gpt_decision["action"] == "HOLD" or (gpt_decision["action"] == "OPEN" and gpt_decision["confidence"] < GPT_MIN_CONFIDENCE):
             db_record_execution(
                 alert_id=alert_id, action="observe", instrument=pair,
                 side=None, units=None, sl_pips=hint_sl, tp_pips=hint_tp,
@@ -1385,79 +1771,170 @@ def webhook():
 
         if gpt_decision["action"] == "CLOSE":
             try:
-                r = close_position(pair)
-                upsert_trade_state(
-                    instrument=pair, is_open=False, side=None, units=None,
-                    entry_price=None, entry_time_ms=None, last_mark_price=None,
-                    unrealized_pl_home=None, realized_pl_home=None
+                # --- Exit-spread protection ---
+                spread_block = (
+                    spread_pips_val is not None and
+                    exit_spread_limit is not None and
+                    float(spread_pips_val) > float(exit_spread_limit)
                 )
-                
+
+                dist_to_ema = float(analysis.get("dist_to_ema_200", 0.0) or 0.0)
+                macro_flip = (
+                    (current_net > 0 and dist_to_ema < 0) or
+                    (current_net < 0 and dist_to_ema > 0)
+                )
+
+                reason_txt = str(gpt_decision.get("reason", "")).lower()
+                keyword_emergency = any(k in reason_txt for k in [
+                    "ema 200", "ema200", "200 ema",
+                    "market structure", "structure break", "break of structure", "bos",
+                    "invalidation", "trend reversed", "reversal"
+                ])
+
+                allow_emergency_close = bool(macro_flip or keyword_emergency)
+
+                if spread_block and not allow_emergency_close:
+                    # Record that we intentionally refused the close
+                    block_meta = {
+                        "blocked_by": "EXIT_SPREAD",
+                        "spread_pips": float(spread_pips_val),
+                        "exit_spread_limit": float(exit_spread_limit),
+                        "dynamic_spread_limit": float(analysis.get("max_spread_pips_entry", 0.0) or 0.0),
+                        "gpt_decision": gpt_decision,
+                        "analysis": analysis,
+                        "note": "Close blocked due to wide spreads; not an emergency invalidation."
+                    }
+                    db_record_execution(
+                        alert_id=alert_id,
+                        action="observe",
+                        instrument=pair,
+                        current_net=current_net,
+                        spread_pips=spread_pips_val,
+                        status="RULE_BLOCKED_EXIT_SPREAD",
+                        meta=json.dumps(block_meta)
+                    )
+                    return {
+                        "status": "RULE_BLOCKED_EXIT_SPREAD",
+                        "spread_pips": spread_pips_val,
+                        "exit_spread_limit": exit_spread_limit,
+                        "reason": "Exit blocked due to wide spread (non-emergency)."
+                    }, 200
+
+                # --- Allowed to close ---
+                r = close_position(pair)
+                sync_trade_state_from_oanda(instrument=pair, acct_ccy=acct_ccy)
+
                 status = "OK" if r.ok else "OANDA_ERROR"
                 db_record_execution(
                     alert_id=alert_id, action="close", instrument=pair, side=None,
                     units=None, sl_pips=None, tp_pips=None, current_net=current_net,
                     projected_net=None, spread_pips=spread_pips_val,
                     oanda_http=r.status_code, status=status, oanda_response=r.text,
-                    meta=json.dumps(gpt_decision)
+                    meta=json.dumps({
+                        **gpt_decision,
+                        "exit_spread_limit": float(exit_spread_limit) if exit_spread_limit is not None else None,
+                        "macro_flip": bool(macro_flip),
+                        "keyword_emergency": bool(keyword_emergency),
+                    })
                 )
                 return {"status": status, "action": "close"}, (200 if r.ok else 502)
+
             except Exception as e:
-                db_record_execution(alert_id=alert_id, action="close", instrument=pair, status="ERROR", oanda_response=str(e), meta=json.dumps(gpt_decision))
+                db_record_execution(
+                    alert_id=alert_id,
+                    action="close",
+                    instrument=pair,
+                    status="ERROR",
+                    oanda_response=str(e),
+                    meta=json.dumps(gpt_decision)
+                )
                 return {"status": "ERROR", "error": str(e)}, 502
 
+
         if gpt_decision["action"] == "OPEN":
-            cooldown_min = int(os.getenv("PYRAMID_COOLDOWN_MINUTES", "15"))
+            # --- [FIXED] Default Cooldown Increased to 60m ---
+            cooldown_min = int(os.getenv("PYRAMID_COOLDOWN_MINUTES", "60"))
             if current_net != 0 and not check_cooldown(pair, cooldown_min):
                 log(f"COOLDOWN_ACTIVE | {pair}")
-                db_record_execution(alert_id=alert_id, action="observe", instrument=pair, status="COOLDOWN_ACTIVE", meta=json.dumps(gpt_decision))
+
+                gpt_reason = str(gpt_decision.get("reason", "")).strip()
+                gpt_conf = gpt_decision.get("confidence", None)
+
+                cooldown_reason = (
+                    f"COOLDOWN_ACTIVE ({cooldown_min}m): suppressed OPEN. "
+                    f"GPT would have OPEN {gpt_decision.get('side')} "
+                    f"(units_mult={gpt_decision.get('units_mult')}, conf={gpt_conf}). "
+                    f"GPT reason: {gpt_reason}"
+                )[:1200]
+
+                cooldown_meta = {
+                    "reason": cooldown_reason,
+                    "confidence": float(gpt_conf) if gpt_conf is not None else None,
+                    "blocked_by": "COOLDOWN_ACTIVE",
+                    "cooldown_minutes": cooldown_min,
+                    "gpt_proposed": gpt_decision,
+                }
+
+                db_record_execution(
+                    alert_id=alert_id,
+                    action="observe",
+                    instrument=pair,
+                    current_net=current_net,
+                    spread_pips=spread_pips_val,
+                    status="COOLDOWN_ACTIVE",
+                    meta=json.dumps(cooldown_meta),
+                )
                 return {"status": "COOLDOWN_ACTIVE"}, 200
-            
+
+            # --- [FIXED] Default Spacing Increased to 300s ---
+            min_spacing_s = int(os.getenv("MIN_ALERT_SPACING_SECONDS", "300"))
+            if not check_min_spacing(pair, min_spacing_s):
+                db_record_execution(
+                    alert_id=alert_id,
+                    action="observe",
+                    instrument=pair,
+                    current_net=current_net,
+                    spread_pips=spread_pips_val,
+                    status="RULE_BLOCKED_MIN_SPACING",
+                    meta=json.dumps({"min_spacing_seconds": min_spacing_s})
+                )
+                return {"status": "RULE_BLOCKED_MIN_SPACING"}, 200
+
             side = gpt_decision["side"]
             if side not in ("buy", "sell"):
                 db_record_execution(alert_id=alert_id, action="observe", instrument=pair, status="GPT_INVALID_SIDE", meta=json.dumps(gpt_decision))
                 return {"status": "GPT_INVALID_SIDE"}, 200
 
-            # -------------------------------------------------------------
-            # DYNAMIC TP LOGIC START
-            # -------------------------------------------------------------
-            # 1. Establish Baselines
-            sl_pips = gpt_decision["sl_pips"] if gpt_decision["sl_pips"] is not None else hint_sl
+            # Dynamic SL/TP
+            default_sl = gpt_decision["sl_pips"] if gpt_decision["sl_pips"] is not None else hint_sl
             default_tp = gpt_decision["tp_pips"] if gpt_decision["tp_pips"] is not None else hint_tp
-            
-            # 2. Extract ATR from features (sent by TradingView)
+            tp_disabled = (default_tp == 0)
+
             atr_val = _f(features.get("atr", 0))
-
             if atr_val > 0:
-                # 3. Convert ATR Price -> Pips
-                # pip_size_for returns Decimal, cast to float for calculation
                 pip_unit = float(pip_size_for(pair))
-                
-                # Example: 0.0015 price / 0.0001 pip_unit = 15.0 pips
                 atr_in_pips = atr_val / pip_unit
-                
-                # 4. Apply Multiplier
-                # Make sure TP_ATR_MULTIPLIER is defined in Config area, or default to 1.5 here
-                multiplier = float(os.getenv("TP_ATR_MULTIPLIER", "1.5"))
-                dynamic_tp = int(atr_in_pips * multiplier)
-                
-                # 5. Enforce Floor (e.g. 10 pips) to prevent spread killing the trade
-                tp_pips = max(10, dynamic_tp)
-                
-                log(f"DYNAMIC_TP | {pair} | ATR={atr_val} ({atr_in_pips:.1f} pips) | Mult={multiplier} | TP={tp_pips}")
-            else:
-                # Fallback to GPT decision or hint if ATR missing
-                tp_pips = default_tp
+                # --- [FIXED] Using M15 calibrated multipliers ---
+                tp_multiplier = float(os.getenv("TP_ATR_MULTIPLIER", "3.0"))
+                sl_multiplier = float(os.getenv("SL_ATR_MULTIPLIER", "2.5"))
 
-            # 6. Apply Safety Caps (Min/Max limits from env)
+                sl_pips = max(10, int(atr_in_pips * sl_multiplier))
+                if tp_disabled:
+                    tp_pips = 0
+                else:
+                    tp_pips = max(10, int(atr_in_pips * tp_multiplier))
+
+                log(f"DYNAMIC_CALC | {pair} | ATR={atr_val} ({atr_in_pips:.1f} pips) | TP={tp_pips} (x{tp_multiplier}) | SL={sl_pips} (x{sl_multiplier})")
+            else:
+                tp_pips = default_tp
+                sl_pips = default_sl
+
             sl_pips = int(max(MIN_SL_PIPS, min(sl_pips, MAX_SL_PIPS)))
             tp_pips = int(max(0, min(tp_pips, MAX_TP_PIPS)))
-            # -------------------------------------------------------------
-            # DYNAMIC TP LOGIC END
-            # -------------------------------------------------------------
 
             meta = {"gpt": gpt_decision, "features": features}
-            
-            if nav is None:
+
+            if nav is None or acct_ccy is None:
                 try:
                     nav, acct_ccy = get_account_nav_and_currency()
                 except Exception as e:
@@ -1479,7 +1956,8 @@ def webhook():
                 current_net=current_net,
                 nav=nav,
                 acct_ccy=acct_ccy,
-                meta=meta
+                meta=meta,
+                max_spread_pips=dynamic_spread_limit
             )
             return resp, status
 
