@@ -11,7 +11,7 @@ sl_pips     = input.int(25, "Default SL pips", minval=1)
 tp_pips     = input.int(50, "Default TP pips", minval=0)
 max_sl_pips = input.int(25, "MAX SL pips", minval=1)
 max_tp_pips = input.int(50, "MAX TP pips", minval=0)
-lookback_n  = input.int(7, "Lookback candles", minval=3, maxval=10)
+lookback_n  = input.int(10, "Lookback candles", minval=5, maxval=20)
 
 // Signal & Indicator Settings
 fastLen       = input.int(12, "Fast EMA")
