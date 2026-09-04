@@ -162,3 +162,5 @@ Notes:
 - This system can place live orders. Test in 'PRACTICE' mode first.
 - Keep 'WEBHOOK_KEY' secret and rotate if exposed.
 - Review and tune risk and session parameters before enabling 'TRADING_ENABLED'.
+
+  https://nomuracampus.tal.net/vx/lang-en-GB/mobile-0/channel-1/appcentre-1/brand-4/user-773260/xf-1cc8fc8323e0/wid-6/spa-1/tmpwid-c566_a5728c35-a328-47e3-8e82-5286e2dfaf47/candidate/application/632229/opportunity
